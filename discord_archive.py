@@ -53,7 +53,7 @@ def load_config(config_path: Path) -> dict:
 # Database
 # ---------------------------------------------------------------------------
 
-# Base schema — only references columns that exist from the start.
+# Base schema — only references columns guaranteed to exist from the start.
 # Columns added by migrations must NOT be indexed here.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
@@ -101,12 +101,11 @@ CREATE INDEX IF NOT EXISTS idx_msg_author     ON messages(author_id);
 CREATE INDEX IF NOT EXISTS idx_msg_reply      ON messages(reply_to_message_id);
 """
 
-# Migrations run after SCHEMA, each wrapped in try/except so they are safe
-# to run against both new and existing databases.
+# Migrations run after SCHEMA — safe to run against existing databases.
+# The parent_channel_id index must come after the column is guaranteed to exist.
 MIGRATIONS = [
     "ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0",
     "ALTER TABLE channels ADD COLUMN parent_channel_id TEXT",
-    # Index on parent_channel_id must come after the column is guaranteed to exist
     "CREATE INDEX IF NOT EXISTS idx_chan_parent ON channels(parent_channel_id)",
 ]
 
@@ -141,14 +140,20 @@ def is_forum_error(stderr: str) -> bool:
 
 def list_channels(config: dict) -> list[dict]:
     """
-    Fetch all channels in the guild.
+    Fetch all channels and active threads in the guild.
 
-    dcex output format (one line per channel):
-        <channel_id> | <category> / <name>
-        <channel_id> | <name>               (no category)
+    Uses --include-threads so that forum threads appear as individual
+    exportable entries alongside regular channels.
+
+    dcex output format (one line per entry):
+        <id> | <category> / <name>
+        <id> | <name>               (no category)
     """
     result = run_dcex(
-        ["channels", "--token", config["token"], "--guild", config["guild_id"]],
+        ["channels",
+         "--token", config["token"],
+         "--guild", config["guild_id"],
+         "--include-threads"],
         config
     )
     if result.returncode != 0:
@@ -177,45 +182,13 @@ def list_channels(config: dict) -> list[dict]:
     return channels
 
 
-def list_threads(channel_id: str, config: dict) -> list[dict]:
-    """
-    List all threads in a forum channel.
-
-    dcex threads output format (one line per thread):
-        <thread_id> | <forum_name> / <thread_title>
-        <thread_id> | <thread_title>
-    """
-    result = run_dcex(
-        ["threads", "--token", config["token"], "--channel", channel_id],
-        config
-    )
-    if result.returncode != 0:
-        logging.warning(f"Failed to list threads for {channel_id}:\n{result.stderr}")
-        return []
-
-    threads = []
-    for line in result.stdout.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split("|", 1)]
-        if len(parts) != 2:
-            logging.warning(f"Unexpected thread line: {line!r}")
-            continue
-        thread_id, rest = parts
-        # Strip the forum channel name prefix if present ("forum_name / thread_title")
-        name = rest.split(" / ", 1)[-1].strip()
-        threads.append({"thread_id": thread_id, "name": name})
-    return threads
-
-
 def export_channel_raw(channel_id: str, after_message_id: str | None,
                        output_dir: Path, config: dict) -> tuple[Path | None, bool]:
     """
     Export a single channel or thread to JSON.
 
-    Returns (json_path, is_forum) where is_forum=True means the channel is a
-    Discord Forum and must be exported thread-by-thread instead.
+    Returns (json_path, is_forum) where is_forum=True means the entry is a
+    Discord Forum container (no messages of its own — skip it).
     """
     args = [
         "export",
@@ -252,15 +225,26 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
 
+    # For thread exports dcex may expose the parent channel ID.
+    # Try common field names defensively.
+    ch = data["channel"]
+    parent_id = (
+        ch.get("parentId")
+        or ch.get("parent_id")
+        or ch.get("categoryId")
+        or None
+    )
+
     channel_meta = {
         "guild_id":          data["guild"]["id"],
         "guild_name":        data["guild"]["name"],
-        "channel_id":        data["channel"]["id"],
-        "name":              data["channel"]["name"],
-        "type":              data["channel"].get("type", ""),
-        "category":          data["channel"].get("category", ""),
-        "topic":             data["channel"].get("topic", ""),
-        "parent_channel_id": None,  # set by caller for thread exports
+        "channel_id":        ch["id"],
+        "name":              ch["name"],
+        "type":              ch.get("type", ""),
+        "category":          ch.get("category", ""),
+        "topic":             ch.get("topic", ""),
+        "parent_channel_id": parent_id,
+        "is_forum":          0,
     }
 
     messages = []
@@ -285,16 +269,12 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
     return channel_meta, messages
 
 
-def ingest_export(conn: sqlite3.Connection, json_path: Path,
-                  parent_channel_id: str | None = None,
-                  is_forum: bool = False) -> int:
+def ingest_export(conn: sqlite3.Connection, json_path: Path) -> int:
     """
     Parse a dcex JSON export and insert new messages.
     Returns the number of new messages inserted.
     """
     channel_meta, messages = parse_export(json_path)
-    channel_meta["parent_channel_id"] = parent_channel_id
-    channel_meta["is_forum"] = 1 if is_forum else 0
 
     conn.execute("""
         INSERT INTO guilds (guild_id, name, first_seen)
@@ -312,7 +292,6 @@ def ingest_export(conn: sqlite3.Connection, json_path: Path,
             category          = excluded.category,
             type              = excluded.type,
             topic             = excluded.topic,
-            is_forum          = excluded.is_forum,
             parent_channel_id = excluded.parent_channel_id
     """, channel_meta)
 
@@ -369,9 +348,9 @@ def get_last_message_id(conn: sqlite3.Connection, channel_id: str) -> str | None
     return row["last_message_id"] if row else None
 
 
-def mark_channel_as_forum(conn: sqlite3.Connection, channel_id: str,
-                           category: str, name: str, guild_id: str):
-    """Record a forum channel in the channels table even if we can't export it directly."""
+def mark_as_forum(conn: sqlite3.Connection, channel_id: str,
+                  category: str, name: str, guild_id: str):
+    """Record a forum container channel — it has no messages itself."""
     conn.execute("""
         INSERT INTO channels (channel_id, guild_id, name, category, type, is_forum)
         VALUES (?, ?, ?, ?, 'GuildForum', 1)
@@ -384,46 +363,65 @@ def mark_channel_as_forum(conn: sqlite3.Connection, channel_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Forum export: enumerate threads and export each one
+# Shared export-and-ingest loop
 # ---------------------------------------------------------------------------
 
-def export_forum(channel_id: str, channel_name: str, channel_category: str,
-                 guild_id: str, output_dir: Path,
-                 conn: sqlite3.Connection, config: dict) -> int:
+def process_channels(channels: list[dict], config: dict, conn: sqlite3.Connection,
+                     output_dir: Path, verbose: bool = True) -> tuple[int, int]:
     """
-    Export all threads of a forum channel.
-    Returns total messages inserted across all threads.
+    Export and ingest a list of channels/threads.
+
+    Returns (total_messages_inserted, channels_with_new_messages).
+    Forum container channels are detected, marked, and skipped gracefully.
     """
-    mark_channel_as_forum(conn, channel_id, channel_category, channel_name, guild_id)
+    guild_id  = config["guild_id"]
+    total_new = 0
+    updated   = 0
 
-    threads = list_threads(channel_id, config)
-    if not threads:
-        logging.warning(f"No threads found in forum #{channel_name}")
-        return 0
+    for i, ch in enumerate(channels, 1):
+        ch_id   = ch["channel_id"]
+        label   = f"#{ch['name']}"
+        if ch.get("category"):
+            label = f"[{ch['category']}] {label}"
 
-    total = 0
-    for thread in threads:
-        tid  = thread["thread_id"]
-        name = thread["name"]
-        last_id = get_last_message_id(conn, tid)
+        last_id = get_last_message_id(conn, ch_id)
 
-        json_path, _ = export_channel_raw(tid, last_id, output_dir, config)
+        if verbose:
+            prefix = f"[{i:3}/{len(channels)}] {label} ... "
+            print(prefix, end="", flush=True)
+
+        json_path, forum = export_channel_raw(ch_id, last_id, output_dir, config)
+
+        if forum:
+            # Forum container — no messages here; threads appear as separate
+            # entries in the channel list via --include-threads.
+            mark_as_forum(conn, ch_id, ch.get("category", ""), ch["name"], guild_id)
+            if verbose:
+                print("(forum container, skipped)")
+            continue
+
         if json_path is None:
-            logging.warning(f"  thread '{name}' ({tid}): export failed, skipping")
+            if verbose:
+                print("SKIPPED")
             continue
 
         try:
-            n = ingest_export(conn, json_path, parent_channel_id=channel_id)
-            update_export_state(conn, tid)
+            n = ingest_export(conn, json_path)
+            update_export_state(conn, ch_id)
+            if verbose:
+                marker = f"+{n}" if last_id else str(n)
+                print(f"{marker} messages")
             if n > 0:
-                logging.info(f"  thread '{name}': {'+' if last_id else ''}{n} messages")
-            total += n
+                total_new += n
+                updated += 1
         except Exception as e:
-            logging.error(f"  thread '{name}': ERROR — {e}")
+            if verbose:
+                print(f"ERROR ({e})")
+            logging.exception(f"Failed to ingest {json_path}")
         finally:
             json_path.unlink(missing_ok=True)
 
-    return total
+    return total_new, updated
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +429,7 @@ def export_forum(channel_id: str, channel_name: str, channel_category: str,
 # ---------------------------------------------------------------------------
 
 def cmd_channels(config: dict, conn: sqlite3.Connection):
-    """List all channels in the guild."""
+    """List all channels and threads in the guild."""
     print(f"Fetching channel list for guild {config['guild_id']}...")
     channels = list_channels(config)
     if not channels:
@@ -443,7 +441,7 @@ def cmd_channels(config: dict, conn: sqlite3.Connection):
         cat = ch["category"] or "(no category)"
         by_category.setdefault(cat, []).append(ch)
 
-    print(f"\n{len(channels)} channels found:\n")
+    print(f"\n{len(channels)} entries found (channels + threads):\n")
     for cat, chs in sorted(by_category.items()):
         print(f"  [{cat}]")
         for ch in chs:
@@ -462,51 +460,17 @@ def cmd_init(config: dict, conn: sqlite3.Connection):
         print("No channels found. Aborting.")
         return
 
-    guild_id = config["guild_id"]
-
-    print(f"Found {len(channels)} channels, exporting all.")
+    print(f"Found {len(channels)} entries (channels + threads), exporting all.")
     print()
 
-    total_inserted = 0
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
+        total, _ = process_channels(channels, config, conn, Path(tmpdir), verbose=True)
 
-        for i, ch in enumerate(channels, 1):
-            ch_id  = ch["channel_id"]
-            label  = f"#{ch['name']} [{ch['category'] or 'no category'}]"
-            print(f"[{i:3}/{len(channels)}] {label} ... ", end="", flush=True)
-
-            json_path, forum = export_channel_raw(ch_id, None, tmp_path, config)
-
-            if forum:
-                print("(forum)", flush=True)
-                n = export_forum(ch_id, ch["name"], ch["category"],
-                                 guild_id, tmp_path, conn, config)
-                print(f"           → {n} messages across threads")
-                total_inserted += n
-                continue
-
-            if json_path is None:
-                print("SKIPPED")
-                continue
-
-            try:
-                n = ingest_export(conn, json_path)
-                update_export_state(conn, ch_id)
-                print(f"{n} messages")
-                total_inserted += n
-            except Exception as e:
-                print(f"ERROR ({e})")
-                logging.exception(f"Failed to ingest {json_path}")
-            finally:
-                json_path.unlink(missing_ok=True)
-
-    print(f"\nDone. {total_inserted} messages ingested into {config['db_path']}")
+    print(f"\nDone. {total} messages ingested into {config['db_path']}")
 
 
 def cmd_sync(config: dict, conn: sqlite3.Connection):
-    """Incremental sync: new messages only, including new forum threads."""
+    """Incremental sync: new messages only."""
     print(f"=== Incremental sync — {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
 
     channels = list_channels(config)
@@ -514,72 +478,23 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
         print("No channels found.")
         return
 
-    guild_id = config["guild_id"]
-    total_new = 0
-    channels_updated = 0
-
-    known_forums = {
-        row["channel_id"]
-        for row in conn.execute("SELECT channel_id FROM channels WHERE is_forum = 1")
-    }
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
+        total, updated = process_channels(channels, config, conn, Path(tmpdir), verbose=False)
 
-        for ch in channels:
-            ch_id = ch["channel_id"]
-            label = f"#{ch['name']}"
-
-            if ch_id in known_forums:
-                n = export_forum(ch_id, ch["name"], ch["category"],
-                                 guild_id, tmp_path, conn, config)
-                if n > 0:
-                    print(f"  {label} (forum): +{n} messages")
-                    total_new += n
-                    channels_updated += 1
-                continue
-
-            last_id   = get_last_message_id(conn, ch_id)
-            json_path, forum = export_channel_raw(ch_id, last_id, tmp_path, config)
-
-            if forum:
-                n = export_forum(ch_id, ch["name"], ch["category"],
-                                 guild_id, tmp_path, conn, config)
-                if n > 0:
-                    print(f"  {label} (forum, new): +{n} messages")
-                    total_new += n
-                    channels_updated += 1
-                continue
-
-            if json_path is None:
-                continue
-
-            try:
-                n = ingest_export(conn, json_path)
-                update_export_state(conn, ch_id)
-                if n > 0:
-                    print(f"  {label}: +{n} new messages")
-                    total_new += n
-                    channels_updated += 1
-            except Exception as e:
-                print(f"  {label}: ERROR — {e}")
-                logging.exception(f"Failed to ingest {json_path}")
-            finally:
-                json_path.unlink(missing_ok=True)
-
-    if total_new == 0:
+    if total == 0:
         print("  No new messages.")
     else:
-        print(f"\n  Total: +{total_new} messages across {channels_updated} channels/forums")
+        # Print a summary line per channel that had new messages
+        print(f"  +{total} messages across {updated} channels/threads")
 
 
 def cmd_stats(config: dict, conn: sqlite3.Connection):
     """Print summary statistics about the archive."""
-    total_msgs    = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    total_chan     = conn.execute("SELECT COUNT(*) FROM channels WHERE is_forum = 0 AND parent_channel_id IS NULL").fetchone()[0]
-    total_forums   = conn.execute("SELECT COUNT(*) FROM channels WHERE is_forum = 1").fetchone()[0]
-    total_threads  = conn.execute("SELECT COUNT(*) FROM channels WHERE parent_channel_id IS NOT NULL").fetchone()[0]
-    total_authors  = conn.execute("SELECT COUNT(DISTINCT author_id) FROM messages").fetchone()[0]
+    total_msgs   = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    total_chan    = conn.execute("SELECT COUNT(*) FROM channels WHERE is_forum = 0 AND parent_channel_id IS NULL").fetchone()[0]
+    total_forums  = conn.execute("SELECT COUNT(*) FROM channels WHERE is_forum = 1").fetchone()[0]
+    total_threads = conn.execute("SELECT COUNT(*) FROM channels WHERE parent_channel_id IS NOT NULL").fetchone()[0]
+    total_authors = conn.execute("SELECT COUNT(DISTINCT author_id) FROM messages").fetchone()[0]
 
     oldest = conn.execute("SELECT MIN(timestamp) FROM messages").fetchone()[0]
     newest = conn.execute("SELECT MAX(timestamp) FROM messages").fetchone()[0]
@@ -588,7 +503,7 @@ def cmd_stats(config: dict, conn: sqlite3.Connection):
     print(f"  Database:      {config['db_path']}")
     print(f"  Messages:      {total_msgs:,}")
     print(f"  Channels:      {total_chan}")
-    print(f"  Forums:        {total_forums}  ({total_threads} threads)")
+    print(f"  Forums:        {total_forums}  ({total_threads} threads archived)")
     print(f"  Authors:       {total_authors}")
     print(f"  Date range:    {oldest[:10] if oldest else 'n/a'} → {newest[:10] if newest else 'n/a'}")
 
@@ -598,7 +513,7 @@ def cmd_stats(config: dict, conn: sqlite3.Connection):
             c.name,
             c.category,
             c.is_forum,
-            p.name  AS parent_name,
+            p.name AS parent_name,
             COUNT(*) AS n
         FROM messages m
         JOIN channels c ON c.channel_id = m.channel_id
@@ -610,8 +525,6 @@ def cmd_stats(config: dict, conn: sqlite3.Connection):
     for row in rows:
         if row["parent_name"]:
             label = f"#{row['parent_name']} › {row['name']}"
-        elif row["is_forum"]:
-            label = f"#{row['name']} (forum)"
         else:
             cat = f"[{row['category']}] " if row["category"] else ""
             label = f"{cat}#{row['name']}"
