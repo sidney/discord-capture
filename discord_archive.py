@@ -53,6 +53,8 @@ def load_config(config_path: Path) -> dict:
 # Database
 # ---------------------------------------------------------------------------
 
+# Base schema — only references columns that exist from the start.
+# Columns added by migrations must NOT be indexed here.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
     guild_id    TEXT PRIMARY KEY,
@@ -97,12 +99,15 @@ CREATE INDEX IF NOT EXISTS idx_msg_channel    ON messages(channel_id);
 CREATE INDEX IF NOT EXISTS idx_msg_timestamp  ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_msg_author     ON messages(author_id);
 CREATE INDEX IF NOT EXISTS idx_msg_reply      ON messages(reply_to_message_id);
-CREATE INDEX IF NOT EXISTS idx_chan_parent     ON channels(parent_channel_id);
 """
 
+# Migrations run after SCHEMA, each wrapped in try/except so they are safe
+# to run against both new and existing databases.
 MIGRATIONS = [
     "ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0",
     "ALTER TABLE channels ADD COLUMN parent_channel_id TEXT",
+    # Index on parent_channel_id must come after the column is guaranteed to exist
+    "CREATE INDEX IF NOT EXISTS idx_chan_parent ON channels(parent_channel_id)",
 ]
 
 
@@ -110,13 +115,12 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
-    # Apply migrations safely for existing databases
     for sql in MIGRATIONS:
         try:
             conn.execute(sql)
             conn.commit()
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass  # column/index already exists
     return conn
 
 
@@ -458,8 +462,6 @@ def cmd_init(config: dict, conn: sqlite3.Connection):
         print("No channels found. Aborting.")
         return
 
-    # Determine guild_id from the first successful export later,
-    # or use config directly.
     guild_id = config["guild_id"]
 
     print(f"Found {len(channels)} channels, exporting all.")
@@ -478,7 +480,6 @@ def cmd_init(config: dict, conn: sqlite3.Connection):
             json_path, forum = export_channel_raw(ch_id, None, tmp_path, config)
 
             if forum:
-                # Forum channel — enumerate and export threads
                 print("(forum)", flush=True)
                 n = export_forum(ch_id, ch["name"], ch["category"],
                                  guild_id, tmp_path, conn, config)
@@ -517,7 +518,6 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
     total_new = 0
     channels_updated = 0
 
-    # Build set of known forum channel IDs from the DB
     known_forums = {
         row["channel_id"]
         for row in conn.execute("SELECT channel_id FROM channels WHERE is_forum = 1")
@@ -530,7 +530,6 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
             ch_id = ch["channel_id"]
             label = f"#{ch['name']}"
 
-            # Channel is a known forum OR we haven't seen it yet and it might be one
             if ch_id in known_forums:
                 n = export_forum(ch_id, ch["name"], ch["category"],
                                  guild_id, tmp_path, conn, config)
@@ -544,7 +543,6 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
             json_path, forum = export_channel_raw(ch_id, last_id, tmp_path, config)
 
             if forum:
-                # Discovered as forum for the first time
                 n = export_forum(ch_id, ch["name"], ch["category"],
                                  guild_id, tmp_path, conn, config)
                 if n > 0:
