@@ -138,16 +138,60 @@ def is_forum_error(stderr: str) -> bool:
     return "is a forum and cannot be exported directly" in stderr
 
 
+# Status suffixes appended to thread names in dcex --include-threads output.
+_THREAD_STATUS_WORDS = {"Active", "Archived"}
+
+
+def _parse_channel_line(line: str) -> dict | None:
+    """
+    Parse one line of dcex channels output.
+
+    Regular channel format:
+        <id> | <category> / <name>
+        <id> | <name>
+
+    Thread format (from --include-threads):
+        * <id> | Thread / <name> | Active
+        * <id> | Thread / <name> | Not archived | Active
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    parts = [p.strip() for p in line.split("|", 1)]
+    if len(parts) != 2:
+        logging.warning(f"Unexpected channel line: {line!r}")
+        return None
+
+    channel_id, rest = parts
+
+    # Thread IDs are prefixed with "* " — strip to get the bare snowflake.
+    channel_id = channel_id.lstrip("*").strip()
+
+    # Split category / name
+    if " / " in rest:
+        category, name = rest.split(" / ", 1)
+    else:
+        category, name = "", rest
+
+    # Strip trailing status tokens ("| Active", "| Not archived | Active", etc.)
+    name = name.strip()
+    while " | " in name and name.rsplit(" | ", 1)[-1].strip() in _THREAD_STATUS_WORDS:
+        name = name.rsplit(" | ", 1)[0].strip()
+
+    return {
+        "channel_id": channel_id,
+        "category":   category.strip(),
+        "name":       name,
+    }
+
+
 def list_channels(config: dict) -> list[dict]:
     """
     Fetch all channels and active threads in the guild.
 
     Uses --include-threads so that forum threads appear as individual
     exportable entries alongside regular channels.
-
-    dcex output format (one line per entry):
-        <id> | <category> / <name>
-        <id> | <name>               (no category)
     """
     result = run_dcex(
         ["channels",
@@ -162,23 +206,9 @@ def list_channels(config: dict) -> list[dict]:
 
     channels = []
     for line in result.stdout.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split("|", 1)]
-        if len(parts) != 2:
-            logging.warning(f"Unexpected channel line: {line!r}")
-            continue
-        channel_id, rest = parts
-        if " / " in rest:
-            category, name = rest.split(" / ", 1)
-        else:
-            category, name = "", rest
-        channels.append({
-            "channel_id": channel_id,
-            "category":   category.strip(),
-            "name":       name.strip(),
-        })
+        entry = _parse_channel_line(line)
+        if entry:
+            channels.append(entry)
     return channels
 
 
@@ -387,14 +417,11 @@ def process_channels(channels: list[dict], config: dict, conn: sqlite3.Connectio
         last_id = get_last_message_id(conn, ch_id)
 
         if verbose:
-            prefix = f"[{i:3}/{len(channels)}] {label} ... "
-            print(prefix, end="", flush=True)
+            print(f"[{i:3}/{len(channels)}] {label} ... ", end="", flush=True)
 
         json_path, forum = export_channel_raw(ch_id, last_id, output_dir, config)
 
         if forum:
-            # Forum container — no messages here; threads appear as separate
-            # entries in the channel list via --include-threads.
             mark_as_forum(conn, ch_id, ch.get("category", ""), ch["name"], guild_id)
             if verbose:
                 print("(forum container, skipped)")
@@ -484,7 +511,6 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
     if total == 0:
         print("  No new messages.")
     else:
-        # Print a summary line per channel that had new messages
         print(f"  +{total} messages across {updated} channels/threads")
 
 
