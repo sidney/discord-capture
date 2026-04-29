@@ -53,8 +53,6 @@ def load_config(config_path: Path) -> dict:
 # Database
 # ---------------------------------------------------------------------------
 
-# Base schema — only references columns guaranteed to exist from the start.
-# Columns added by migrations must NOT be indexed here.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
     guild_id    TEXT PRIMARY KEY,
@@ -101,12 +99,19 @@ CREATE INDEX IF NOT EXISTS idx_msg_author     ON messages(author_id);
 CREATE INDEX IF NOT EXISTS idx_msg_reply      ON messages(reply_to_message_id);
 """
 
-# Migrations run after SCHEMA — safe to run against existing databases.
-# The parent_channel_id index must come after the column is guaranteed to exist.
 MIGRATIONS = [
     "ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0",
     "ALTER TABLE channels ADD COLUMN parent_channel_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_chan_parent ON channels(parent_channel_id)",
+    # Clear parent_channel_id values that were incorrectly set from categoryId
+    # (Discord category IDs) rather than real thread parent IDs. A genuine
+    # parent_channel_id points to a channel that exists in our channels table;
+    # category IDs never do since we don't ingest category objects.
+    """UPDATE channels
+       SET parent_channel_id = NULL
+       WHERE parent_channel_id IS NOT NULL
+         AND is_forum = 0
+         AND parent_channel_id NOT IN (SELECT channel_id FROM channels WHERE is_forum = 1)""",
 ]
 
 
@@ -138,7 +143,6 @@ def is_forum_error(stderr: str) -> bool:
     return "is a forum and cannot be exported directly" in stderr
 
 
-# Status suffixes appended to thread names in dcex --include-threads output.
 _THREAD_STATUS_WORDS = {"Active", "Archived"}
 
 
@@ -146,13 +150,10 @@ def _parse_channel_line(line: str) -> dict | None:
     """
     Parse one line of dcex channels output.
 
-    Regular channel format:
-        <id> | <category> / <name>
-        <id> | <name>
-
-    Thread format (from --include-threads):
-        * <id> | Thread / <name> | Active
-        * <id> | Thread / <name> | Not archived | Active
+    Regular channel:  <id> | <category> / <name>
+                      <id> | <name>
+    Thread:         * <id> | Thread / <name> | Active
+                    * <id> | Thread / <name> | Not archived | Active
     """
     line = line.strip()
     if not line:
@@ -164,17 +165,13 @@ def _parse_channel_line(line: str) -> dict | None:
         return None
 
     channel_id, rest = parts
-
-    # Thread IDs are prefixed with "* " — strip to get the bare snowflake.
     channel_id = channel_id.lstrip("*").strip()
 
-    # Split category / name
     if " / " in rest:
         category, name = rest.split(" / ", 1)
     else:
         category, name = "", rest
 
-    # Strip trailing status tokens ("| Active", "| Not archived | Active", etc.)
     name = name.strip()
     while " | " in name and name.rsplit(" | ", 1)[-1].strip() in _THREAD_STATUS_WORDS:
         name = name.rsplit(" | ", 1)[0].strip()
@@ -187,12 +184,7 @@ def _parse_channel_line(line: str) -> dict | None:
 
 
 def list_channels(config: dict) -> list[dict]:
-    """
-    Fetch all channels and active threads in the guild.
-
-    Uses --include-threads so that forum threads appear as individual
-    exportable entries alongside regular channels.
-    """
+    """Fetch all channels and active threads in the guild."""
     result = run_dcex(
         ["channels",
          "--token", config["token"],
@@ -216,9 +208,7 @@ def export_channel_raw(channel_id: str, after_message_id: str | None,
                        output_dir: Path, config: dict) -> tuple[Path | None, bool]:
     """
     Export a single channel or thread to JSON.
-
-    Returns (json_path, is_forum) where is_forum=True means the entry is a
-    Discord Forum container (no messages of its own — skip it).
+    Returns (json_path, is_forum_container).
     """
     args = [
         "export",
@@ -255,15 +245,12 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    # For thread exports dcex may expose the parent channel ID.
-    # Try common field names defensively.
     ch = data["channel"]
-    parent_id = (
-        ch.get("parentId")
-        or ch.get("parent_id")
-        or ch.get("categoryId")
-        or None
-    )
+
+    # parentId in dcex JSON is the forum channel that owns this thread.
+    # categoryId is the Discord UI category (e.g. "💬COMMUNITY") — not a
+    # parent channel, so we deliberately ignore it here.
+    parent_id = ch.get("parentId") or ch.get("parent_id") or None
 
     channel_meta = {
         "guild_id":          data["guild"]["id"],
@@ -300,10 +287,7 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
 
 
 def ingest_export(conn: sqlite3.Connection, json_path: Path) -> int:
-    """
-    Parse a dcex JSON export and insert new messages.
-    Returns the number of new messages inserted.
-    """
+    """Parse a dcex JSON export and insert new messages. Returns count inserted."""
     channel_meta, messages = parse_export(json_path)
 
     conn.execute("""
@@ -400,17 +384,15 @@ def process_channels(channels: list[dict], config: dict, conn: sqlite3.Connectio
                      output_dir: Path, verbose: bool = True) -> tuple[int, int]:
     """
     Export and ingest a list of channels/threads.
-
     Returns (total_messages_inserted, channels_with_new_messages).
-    Forum container channels are detected, marked, and skipped gracefully.
     """
     guild_id  = config["guild_id"]
     total_new = 0
     updated   = 0
 
     for i, ch in enumerate(channels, 1):
-        ch_id   = ch["channel_id"]
-        label   = f"#{ch['name']}"
+        ch_id = ch["channel_id"]
+        label = f"#{ch['name']}"
         if ch.get("category"):
             label = f"[{ch['category']}] {label}"
 
