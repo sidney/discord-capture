@@ -125,12 +125,14 @@ def run_dcex(args: list, config: dict) -> subprocess.CompletedProcess:
 def list_channels(config: dict) -> list[dict]:
     """
     Fetch all channels in the guild.
-    Returns a list of dicts with keys: channel_id, name, category, type.
+    Returns a list of dicts with keys: channel_id, name, category.
 
     dcex channels output format (one channel per line):
-        <channel_id> | <type> | <category> | <name>
+        <channel_id> | <category> / <name>   (channel with a category)
+        <channel_id> | <name>                 (channel with no category)
 
-    Note: channels without a category show an empty category field.
+    Channel type is not included in the listing output — it is captured
+    from the exported JSON during ingest.
     """
     result = run_dcex(
         ["channels", "--token", config["token"], "--guild", config["guild_id"]],
@@ -145,16 +147,26 @@ def list_channels(config: dict) -> list[dict]:
         line = line.strip()
         if not line:
             continue
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 4:
+
+        # Split on the first pipe only — gives [channel_id, rest]
+        parts = [p.strip() for p in line.split("|", 1)]
+        if len(parts) != 2:
             logging.warning(f"Unexpected channel line format: {line!r}")
             continue
-        channel_id, ch_type, category, name = parts[0], parts[1], parts[2], parts[3]
+
+        channel_id, rest = parts[0], parts[1]
+
+        # rest is either "Category / name" or just "name"
+        if " / " in rest:
+            category, name = rest.split(" / ", 1)
+        else:
+            category, name = "", rest
+
         channels.append({
             "channel_id": channel_id,
-            "type":       ch_type,
-            "category":   category,
-            "name":       name,
+            "type":       "",   # not available from listing; populated during ingest
+            "category":   category.strip(),
+            "name":       name.strip(),
         })
 
     return channels
@@ -182,7 +194,7 @@ def export_channel(channel_id: str, after_message_id: str | None,
     result = run_dcex(args, config)
 
     if result.returncode != 0:
-        # Some channels (e.g. announcement-only, stage channels) may not be
+        # Some channels (e.g. announcement-only, voice, stage) may not be
         # exportable — log and continue rather than crashing.
         logging.warning(f"Export failed for channel {channel_id}: {result.stderr.strip()}")
         return None
@@ -270,14 +282,15 @@ def ingest_export(conn: sqlite3.Connection, json_path: Path) -> int:
         ON CONFLICT(guild_id) DO UPDATE SET name = excluded.name
     """, {**channel_meta, "now": datetime.now(timezone.utc).isoformat()})
 
-    # Upsert channel
+    # Upsert channel — type is populated here from the export JSON
     conn.execute("""
         INSERT INTO channels (channel_id, guild_id, name, category, type, topic)
         VALUES (:channel_id, :guild_id, :name, :category, :type, :topic)
         ON CONFLICT(channel_id) DO UPDATE SET
-            name = excluded.name,
+            name     = excluded.name,
             category = excluded.category,
-            topic = excluded.topic
+            type     = excluded.type,
+            topic    = excluded.topic
     """, channel_meta)
 
     # Insert messages (ignore duplicates — safe for reruns)
@@ -359,7 +372,7 @@ def cmd_channels(config: dict, conn: sqlite3.Connection):
     for cat, chs in sorted(by_category.items()):
         print(f"  [{cat}]")
         for ch in chs:
-            print(f"    {ch['channel_id']}  {ch['type']:<25}  #{ch['name']}")
+            print(f"    {ch['channel_id']}  #{ch['name']}")
     print()
 
 
@@ -377,12 +390,7 @@ def cmd_init(config: dict, conn: sqlite3.Connection):
         print("No channels found. Aborting.")
         return
 
-    excluded_types = set(config.get("exclude_channel_types", []))
-    exportable = [c for c in channels if c["type"] not in excluded_types]
-    skipped = len(channels) - len(exportable)
-
-    print(f"Found {len(channels)} channels, exporting {len(exportable)}"
-          f"{f' (skipping {skipped} excluded types)' if skipped else ''}.")
+    print(f"Found {len(channels)} channels, exporting all.")
     print()
 
     total_inserted = 0
@@ -390,10 +398,10 @@ def cmd_init(config: dict, conn: sqlite3.Connection):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
 
-        for i, ch in enumerate(exportable, 1):
+        for i, ch in enumerate(channels, 1):
             ch_id = ch["channel_id"]
             label = f"#{ch['name']} [{ch['category'] or 'no category'}]"
-            print(f"[{i:3}/{len(exportable)}] {label} ... ", end="", flush=True)
+            print(f"[{i:3}/{len(channels)}] {label} ... ", end="", flush=True)
 
             json_path = export_channel(ch_id, after_message_id=None, output_dir=tmp_path, config=config)
 
@@ -427,16 +435,13 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
         print("No channels found.")
         return
 
-    excluded_types = set(config.get("exclude_channel_types", []))
-    exportable = [c for c in channels if c["type"] not in excluded_types]
-
     total_new = 0
     channels_updated = 0
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
 
-        for ch in exportable:
+        for ch in channels:
             ch_id = ch["channel_id"]
             last_id = get_last_message_id(conn, ch_id)
             label = f"#{ch['name']}"
@@ -479,7 +484,7 @@ def cmd_stats(config: dict, conn: sqlite3.Connection):
     print(f"  Messages:   {total_msgs:,}")
     print(f"  Channels:   {total_channels}")
     print(f"  Authors:    {total_authors}")
-    print(f"  Date range: {oldest[:10] if oldest else 'n/a'} \u2192 {newest[:10] if newest else 'n/a'}")
+    print(f"  Date range: {oldest[:10] if oldest else 'n/a'} → {newest[:10] if newest else 'n/a'}")
 
     print(f"\n  Top channels by message count:")
     rows = conn.execute("""
