@@ -13,8 +13,8 @@ Runs incrementally — each sync fetches only messages newer than the last expor
 ## Setup
 
 ```bash
-git clone git@github.com:sidney/discord-capture.git ~/OpenSources/discord-capture
-cd ~/OpenSources/discord-capture
+git clone git@github.com:sidney/discord-capture.git ~/OpenSource/discord-capture
+cd ~/OpenSource/discord-capture
 chmod +x setup.sh
 ./setup.sh
 ```
