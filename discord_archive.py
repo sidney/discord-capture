@@ -8,6 +8,7 @@ Runs incrementally: each sync only fetches messages newer than the last export.
 Usage:
     python3 discord_archive.py --init     # First run: discover channels + full export
     python3 discord_archive.py --sync     # Subsequent runs: incremental update
+    python3 discord_archive.py --backfill # One-time: fetch all archived forum threads
     python3 discord_archive.py --channels # Just list channels, no export
     python3 discord_archive.py --stats    # Print archive statistics
 """
@@ -19,6 +20,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,10 +107,7 @@ MIGRATIONS = [
     "ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0",
     "ALTER TABLE channels ADD COLUMN parent_channel_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_chan_parent ON channels(parent_channel_id)",
-    # Clear parent_channel_id values that were incorrectly set from categoryId
-    # (Discord category IDs) rather than real thread parent IDs. A genuine
-    # parent_channel_id points to a channel that exists in our channels table;
-    # category IDs never do since we don't ingest category objects.
+    # Clear parent_channel_id values incorrectly set from categoryId.
     """UPDATE channels
        SET parent_channel_id = NULL
        WHERE parent_channel_id IS NOT NULL
@@ -124,7 +125,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
             conn.execute(sql)
             conn.commit()
         except sqlite3.OperationalError:
-            pass  # column/index already exists
+            pass
     return conn
 
 
@@ -133,7 +134,6 @@ def open_db(db_path: str) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def run_dcex(args: list, config: dict) -> subprocess.CompletedProcess:
-    """Run a dcex command and return the CompletedProcess (always, even on error)."""
     cmd = [config["dcex_path"]] + args
     logging.debug(f"Running: {' '.join(cmd)}")
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -237,6 +237,70 @@ def export_channel_raw(channel_id: str, after_message_id: str | None,
 
 
 # ---------------------------------------------------------------------------
+# Discord API helpers (used only for archived thread enumeration)
+# ---------------------------------------------------------------------------
+
+DISCORD_API = "https://discord.com/api/v10"
+
+
+def _discord_get(path: str, token: str) -> dict:
+    """Make a single authenticated GET request to the Discord API."""
+    url = f"{DISCORD_API}{path}"
+    req = urllib.request.Request(url, headers={"Authorization": token})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def fetch_archived_threads(forum_id: str, token: str) -> list[dict]:
+    """
+    Paginate through ALL archived threads in a forum channel via the Discord API.
+
+    Returns a list of dicts with keys: thread_id, name.
+
+    The endpoint returns up to 100 threads per page ordered by archive_timestamp
+    descending. Pagination uses the `before` parameter set to the last thread ID
+    from the previous page.
+    """
+    threads = []
+    before  = None
+
+    while True:
+        path = f"/channels/{forum_id}/threads/archived/public?limit=100"
+        if before:
+            path += f"&before={before}"
+
+        try:
+            data = _discord_get(path, token)
+        except urllib.error.HTTPError as e:
+            logging.warning(f"Discord API error for forum {forum_id}: {e.code} {e.reason}")
+            break
+        except Exception as e:
+            logging.warning(f"Discord API request failed for forum {forum_id}: {e}")
+            break
+
+        batch = data.get("threads", [])
+        for t in batch:
+            threads.append({"thread_id": t["id"], "name": t["name"]})
+
+        if not data.get("has_more", False) or not batch:
+            break
+
+        # Pagination: use the last thread ID as the `before` cursor.
+        # Discord uses snowflake IDs which sort chronologically, but the
+        # archived threads endpoint uses archive_timestamp for ordering.
+        # The correct cursor is the archive_timestamp of the last entry,
+        # available as thread_metadata.archive_timestamp in the response.
+        last = batch[-1]
+        archive_ts = last.get("thread_metadata", {}).get("archive_timestamp")
+        before = archive_ts if archive_ts else last["id"]
+
+        # Be polite to the API.
+        time.sleep(0.5)
+
+    return threads
+
+
+# ---------------------------------------------------------------------------
 # JSON parsing + ingestion
 # ---------------------------------------------------------------------------
 
@@ -246,10 +310,6 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
         data = json.load(f)
 
     ch = data["channel"]
-
-    # parentId in dcex JSON is the forum channel that owns this thread.
-    # categoryId is the Discord UI category (e.g. "💬COMMUNITY") — not a
-    # parent channel, so we deliberately ignore it here.
     parent_id = ch.get("parentId") or ch.get("parent_id") or None
 
     channel_meta = {
@@ -496,6 +556,83 @@ def cmd_sync(config: dict, conn: sqlite3.Connection):
         print(f"  +{total} messages across {updated} channels/threads")
 
 
+def cmd_backfill(config: dict, conn: sqlite3.Connection):
+    """
+    One-time backfill of archived forum threads via the Discord API.
+
+    --include-threads only returns active threads. This command fetches
+    the complete list of archived threads for every known forum channel
+    directly from the Discord API, then exports any not yet in the archive.
+    Safe to re-run: threads already in export_state are skipped.
+    """
+    print("=== Archived thread backfill ===")
+
+    forum_rows = conn.execute(
+        "SELECT channel_id, name, category FROM channels WHERE is_forum = 1"
+    ).fetchall()
+
+    if not forum_rows:
+        print("No forum channels found in DB. Run --init or --sync first.")
+        return
+
+    known_threads = {
+        row["channel_id"]
+        for row in conn.execute("SELECT channel_id FROM export_state")
+    }
+
+    total_new_threads = 0
+    total_new_messages = 0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+
+        for forum in forum_rows:
+            forum_id   = forum["channel_id"]
+            forum_name = forum["name"]
+            category   = forum["category"] or ""
+            label      = f"[{category}] #{forum_name}" if category else f"#{forum_name}"
+
+            print(f"\n{label} — fetching archived threads via API...")
+            archived = fetch_archived_threads(forum_id, config["token"])
+
+            if not archived:
+                print(f"  No archived threads found (or API error).")
+                continue
+
+            new_threads = [t for t in archived if t["thread_id"] not in known_threads]
+            print(f"  {len(archived)} archived threads total, "
+                  f"{len(new_threads)} not yet in archive.")
+
+            for i, thread in enumerate(new_threads, 1):
+                tid   = thread["thread_id"]
+                tname = thread["name"]
+                print(f"  [{i:3}/{len(new_threads)}] #{tname} ... ", end="", flush=True)
+
+                json_path, _ = export_channel_raw(tid, None, tmp_path, config)
+                if json_path is None:
+                    print("SKIPPED")
+                    continue
+
+                try:
+                    n = ingest_export(conn, json_path)
+                    update_export_state(conn, tid)
+                    print(f"{n} messages")
+                    total_new_messages += n
+                    total_new_threads  += 1
+                    known_threads.add(tid)
+                except Exception as e:
+                    print(f"ERROR ({e})")
+                    logging.exception(f"Failed to ingest {json_path}")
+                finally:
+                    json_path.unlink(missing_ok=True)
+
+                # Small delay to avoid hammering dcex back-to-back.
+                time.sleep(0.2)
+
+    print(f"\nDone. {total_new_threads} threads, "
+          f"{total_new_messages} messages added to {config['db_path']}")
+
+
 def cmd_stats(config: dict, conn: sqlite3.Connection):
     """Print summary statistics about the archive."""
     total_msgs   = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
@@ -564,6 +701,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--init",     action="store_true", help="First run: full export of all channels")
     group.add_argument("--sync",     action="store_true", help="Incremental sync (new messages only)")
+    group.add_argument("--backfill", action="store_true", help="One-time: fetch all archived forum threads")
     group.add_argument("--channels", action="store_true", help="List channels without exporting")
     group.add_argument("--stats",    action="store_true", help="Show archive statistics")
 
@@ -589,6 +727,8 @@ def main():
             cmd_init(config, conn)
         elif args.sync:
             cmd_sync(config, conn)
+        elif args.backfill:
+            cmd_backfill(config, conn)
         elif args.stats:
             cmd_stats(config, conn)
     finally:
