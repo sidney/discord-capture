@@ -6,16 +6,19 @@ Uses DiscordChatExporter CLI (dcex) for message retrieval.
 Runs incrementally: each sync only fetches messages newer than the last export.
 
 Usage:
-    python3 discord_archive.py --init     # First run: discover channels + full export
-    python3 discord_archive.py --sync     # Subsequent runs: incremental update
-    python3 discord_archive.py --backfill # One-time: fetch all archived forum threads
-    python3 discord_archive.py --channels # Just list channels, no export
+    python3 discord_archive.py --init     # First run: full export
+    python3 discord_archive.py --sync     # Incremental update
+    python3 discord_archive.py --daemon   # Long-running sync loop (for Oracle VM)
+    python3 discord_archive.py --backfill # One-time: fetch archived forum threads
+    python3 discord_archive.py --channels # List channels without exporting
     python3 discord_archive.py --stats    # Print archive statistics
 """
 
 import argparse
 import json
 import logging
+import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -40,17 +43,63 @@ def load_config(config_path: Path) -> dict:
     with open(config_path) as f:
         config = json.load(f)
 
-    required = ["token", "guild_id"]
-    for key in required:
-        if not config.get(key) or config[key].startswith("YOUR_"):
-            print(f"ERROR: config.json is missing a value for '{key}'")
-            print("Edit config.json before running.")
-            sys.exit(1)
+    if not config.get("guild_id") or config["guild_id"].startswith("YOUR_"):
+        print("ERROR: config.json is missing a value for 'guild_id'")
+        sys.exit(1)
+
+    # Token is required unless vault_secret_ocid is configured.
+    has_vault = bool(config.get("vault_secret_ocid", "").strip())
+    has_token = bool(config.get("token", "").strip()) and \
+                not config.get("token", "").startswith("YOUR_")
+    if not has_vault and not has_token:
+        print("ERROR: Provide either 'token' or 'vault_secret_ocid' in config.json")
+        sys.exit(1)
 
     config.setdefault("db_path", "discord_archive.db")
     config.setdefault("dcex_path", "dcex")
     config.setdefault("log_level", "INFO")
+    config.setdefault("sync_interval_hours", 12)
+    config.setdefault("pid_file", "/tmp/discord_archive.pid")
+    config.setdefault("vault_secret_ocid", "")
     return config
+
+
+# ---------------------------------------------------------------------------
+# Token resolution (OCI Vault or config fallback)
+# ---------------------------------------------------------------------------
+
+def resolve_token(config: dict) -> str:
+    """
+    Resolve the Discord token.
+
+    If vault_secret_ocid is set, fetch from OCI Vault using instance principal
+    authentication (no credentials needed on an OCI VM). Falls back to
+    config['token'] if Vault is not configured or unavailable — this allows
+    the same script to run on a Mac with a plain config.json token.
+    """
+    ocid = config.get("vault_secret_ocid", "").strip()
+    if ocid:
+        try:
+            import base64
+            import oci  # pip install oci  (only needed on Oracle VM)
+            logging.info("Fetching token from OCI Vault...")
+            signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+            client = oci.secrets.SecretsClient({}, signer=signer)
+            bundle = client.get_secret_bundle(ocid)
+            content = bundle.data.secret_bundle_content.content
+            token = base64.b64decode(content).decode("utf-8").strip()
+            logging.info("Token fetched from OCI Vault.")
+            return token
+        except ImportError:
+            logging.warning("oci package not installed — falling back to config token")
+        except Exception as e:
+            logging.warning(f"OCI Vault fetch failed: {e} — falling back to config token")
+
+    token = config.get("token", "").strip()
+    if not token or token.startswith("YOUR_"):
+        print("ERROR: No token available. Set vault_secret_ocid or token in config.json")
+        sys.exit(1)
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +156,6 @@ MIGRATIONS = [
     "ALTER TABLE channels ADD COLUMN is_forum INTEGER DEFAULT 0",
     "ALTER TABLE channels ADD COLUMN parent_channel_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_chan_parent ON channels(parent_channel_id)",
-    # Clear parent_channel_id values incorrectly set from categoryId.
     """UPDATE channels
        SET parent_channel_id = NULL
        WHERE parent_channel_id IS NOT NULL
@@ -147,55 +195,35 @@ _THREAD_STATUS_WORDS = {"Active", "Archived"}
 
 
 def _parse_channel_line(line: str) -> dict | None:
-    """
-    Parse one line of dcex channels output.
-
-    Regular channel:  <id> | <category> / <name>
-                      <id> | <name>
-    Thread:         * <id> | Thread / <name> | Active
-                    * <id> | Thread / <name> | Not archived | Active
-    """
     line = line.strip()
     if not line:
         return None
-
     parts = [p.strip() for p in line.split("|", 1)]
     if len(parts) != 2:
         logging.warning(f"Unexpected channel line: {line!r}")
         return None
-
     channel_id, rest = parts
     channel_id = channel_id.lstrip("*").strip()
-
     if " / " in rest:
         category, name = rest.split(" / ", 1)
     else:
         category, name = "", rest
-
     name = name.strip()
     while " | " in name and name.rsplit(" | ", 1)[-1].strip() in _THREAD_STATUS_WORDS:
         name = name.rsplit(" | ", 1)[0].strip()
-
-    return {
-        "channel_id": channel_id,
-        "category":   category.strip(),
-        "name":       name,
-    }
+    return {"channel_id": channel_id, "category": category.strip(), "name": name}
 
 
 def list_channels(config: dict) -> list[dict]:
     """Fetch all channels and active threads in the guild."""
     result = run_dcex(
-        ["channels",
-         "--token", config["token"],
-         "--guild", config["guild_id"],
-         "--include-threads"],
+        ["channels", "--token", config["token"],
+         "--guild", config["guild_id"], "--include-threads"],
         config
     )
     if result.returncode != 0:
         logging.error(f"Failed to list channels:\n{result.stderr}")
         return []
-
     channels = []
     for line in result.stdout.strip().splitlines():
         entry = _parse_channel_line(line)
@@ -206,45 +234,33 @@ def list_channels(config: dict) -> list[dict]:
 
 def export_channel_raw(channel_id: str, after_message_id: str | None,
                        output_dir: Path, config: dict) -> tuple[Path | None, bool]:
-    """
-    Export a single channel or thread to JSON.
-    Returns (json_path, is_forum_container).
-    """
-    args = [
-        "export",
-        "--token",   config["token"],
-        "--channel", channel_id,
-        "--format",  "Json",
-        "--output",  str(output_dir),
-    ]
+    """Export a channel/thread to JSON. Returns (path, is_forum_container)."""
+    args = ["export", "--token", config["token"],
+            "--channel", channel_id, "--format", "Json",
+            "--output", str(output_dir)]
     if after_message_id:
         args += ["--after", after_message_id]
-
     result = run_dcex(args, config)
-
     if result.returncode != 0:
         if is_forum_error(result.stderr):
             return None, True
         logging.warning(f"Export failed for {channel_id}: {result.stderr.strip()}")
         return None, False
-
     json_files = sorted(output_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
     if not json_files:
         logging.warning(f"No JSON file produced for channel {channel_id}")
         return None, False
-
     return json_files[-1], False
 
 
 # ---------------------------------------------------------------------------
-# Discord API helpers (used only for archived thread enumeration)
+# Discord API helpers (archived thread enumeration only)
 # ---------------------------------------------------------------------------
 
 DISCORD_API = "https://discord.com/api/v10"
 
 
 def _discord_get(path: str, token: str) -> dict:
-    """Make a single authenticated GET request to the Discord API."""
     url = f"{DISCORD_API}{path}"
     req = urllib.request.Request(url, headers={"Authorization": token})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -252,23 +268,13 @@ def _discord_get(path: str, token: str) -> dict:
 
 
 def fetch_archived_threads(forum_id: str, token: str) -> list[dict]:
-    """
-    Paginate through ALL archived threads in a forum channel via the Discord API.
-
-    Returns a list of dicts with keys: thread_id, name.
-
-    The endpoint returns up to 100 threads per page ordered by archive_timestamp
-    descending. Pagination uses the `before` parameter set to the last thread ID
-    from the previous page.
-    """
+    """Paginate all archived threads in a forum channel via the Discord API."""
     threads = []
     before  = None
-
     while True:
         path = f"/channels/{forum_id}/threads/archived/public?limit=100"
         if before:
             path += f"&before={before}"
-
         try:
             data = _discord_get(path, token)
         except urllib.error.HTTPError as e:
@@ -277,26 +283,15 @@ def fetch_archived_threads(forum_id: str, token: str) -> list[dict]:
         except Exception as e:
             logging.warning(f"Discord API request failed for forum {forum_id}: {e}")
             break
-
         batch = data.get("threads", [])
         for t in batch:
             threads.append({"thread_id": t["id"], "name": t["name"]})
-
         if not data.get("has_more", False) or not batch:
             break
-
-        # Pagination: use the last thread ID as the `before` cursor.
-        # Discord uses snowflake IDs which sort chronologically, but the
-        # archived threads endpoint uses archive_timestamp for ordering.
-        # The correct cursor is the archive_timestamp of the last entry,
-        # available as thread_metadata.archive_timestamp in the response.
         last = batch[-1]
         archive_ts = last.get("thread_metadata", {}).get("archive_timestamp")
         before = archive_ts if archive_ts else last["id"]
-
-        # Be polite to the API.
         time.sleep(0.5)
-
     return threads
 
 
@@ -305,13 +300,10 @@ def fetch_archived_threads(forum_id: str, token: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
-    """Parse a dcex JSON export. Returns (channel_meta, messages)."""
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
-
     ch = data["channel"]
     parent_id = ch.get("parentId") or ch.get("parent_id") or None
-
     channel_meta = {
         "guild_id":          data["guild"]["id"],
         "guild_name":        data["guild"]["name"],
@@ -323,7 +315,6 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
         "parent_channel_id": parent_id,
         "is_forum":          0,
     }
-
     messages = []
     for m in data.get("messages", []):
         author    = m.get("author", {})
@@ -342,20 +333,16 @@ def parse_export(json_path: Path) -> tuple[dict, list[dict]]:
             "raw_json":            json.dumps(m, ensure_ascii=False),
             "ingested_at":         datetime.now(timezone.utc).isoformat(),
         })
-
     return channel_meta, messages
 
 
 def ingest_export(conn: sqlite3.Connection, json_path: Path) -> int:
-    """Parse a dcex JSON export and insert new messages. Returns count inserted."""
     channel_meta, messages = parse_export(json_path)
-
     conn.execute("""
         INSERT INTO guilds (guild_id, name, first_seen)
         VALUES (:guild_id, :guild_name, :now)
         ON CONFLICT(guild_id) DO UPDATE SET name = excluded.name
     """, {**channel_meta, "now": datetime.now(timezone.utc).isoformat()})
-
     conn.execute("""
         INSERT INTO channels
             (channel_id, guild_id, name, category, type, topic, is_forum, parent_channel_id)
@@ -368,7 +355,6 @@ def ingest_export(conn: sqlite3.Connection, json_path: Path) -> int:
             topic             = excluded.topic,
             parent_channel_id = excluded.parent_channel_id
     """, channel_meta)
-
     inserted = 0
     for msg in messages:
         try:
@@ -385,19 +371,16 @@ def ingest_export(conn: sqlite3.Connection, json_path: Path) -> int:
             inserted += 1
         except sqlite3.IntegrityError:
             pass
-
     conn.commit()
     return inserted
 
 
 def update_export_state(conn: sqlite3.Connection, channel_id: str):
-    """Record the newest message_id seen for a channel or thread."""
     row = conn.execute("""
         SELECT message_id FROM messages
         WHERE channel_id = ?
         ORDER BY timestamp DESC LIMIT 1
     """, (channel_id,)).fetchone()
-
     if row:
         total = conn.execute(
             "SELECT COUNT(*) FROM messages WHERE channel_id = ?", (channel_id,)
@@ -424,7 +407,6 @@ def get_last_message_id(conn: sqlite3.Connection, channel_id: str) -> str | None
 
 def mark_as_forum(conn: sqlite3.Connection, channel_id: str,
                   category: str, name: str, guild_id: str):
-    """Record a forum container channel — it has no messages itself."""
     conn.execute("""
         INSERT INTO channels (channel_id, guild_id, name, category, type, is_forum)
         VALUES (?, ?, ?, ?, 'GuildForum', 1)
@@ -442,38 +424,27 @@ def mark_as_forum(conn: sqlite3.Connection, channel_id: str,
 
 def process_channels(channels: list[dict], config: dict, conn: sqlite3.Connection,
                      output_dir: Path, verbose: bool = True) -> tuple[int, int]:
-    """
-    Export and ingest a list of channels/threads.
-    Returns (total_messages_inserted, channels_with_new_messages).
-    """
     guild_id  = config["guild_id"]
     total_new = 0
     updated   = 0
-
     for i, ch in enumerate(channels, 1):
         ch_id = ch["channel_id"]
         label = f"#{ch['name']}"
         if ch.get("category"):
             label = f"[{ch['category']}] {label}"
-
         last_id = get_last_message_id(conn, ch_id)
-
         if verbose:
             print(f"[{i:3}/{len(channels)}] {label} ... ", end="", flush=True)
-
         json_path, forum = export_channel_raw(ch_id, last_id, output_dir, config)
-
         if forum:
             mark_as_forum(conn, ch_id, ch.get("category", ""), ch["name"], guild_id)
             if verbose:
                 print("(forum container, skipped)")
             continue
-
         if json_path is None:
             if verbose:
                 print("SKIPPED")
             continue
-
         try:
             n = ingest_export(conn, json_path)
             update_export_state(conn, ch_id)
@@ -489,8 +460,17 @@ def process_channels(channels: list[dict], config: dict, conn: sqlite3.Connectio
             logging.exception(f"Failed to ingest {json_path}")
         finally:
             json_path.unlink(missing_ok=True)
-
     return total_new, updated
+
+
+def run_sync(config: dict, conn: sqlite3.Connection) -> tuple[int, int]:
+    """Run one sync cycle. Returns (total_new, channels_updated)."""
+    channels = list_channels(config)
+    if not channels:
+        logging.warning("No channels found during sync")
+        return 0, 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        return process_channels(channels, config, conn, Path(tmpdir), verbose=False)
 
 
 # ---------------------------------------------------------------------------
@@ -498,18 +478,15 @@ def process_channels(channels: list[dict], config: dict, conn: sqlite3.Connectio
 # ---------------------------------------------------------------------------
 
 def cmd_channels(config: dict, conn: sqlite3.Connection):
-    """List all channels and threads in the guild."""
     print(f"Fetching channel list for guild {config['guild_id']}...")
     channels = list_channels(config)
     if not channels:
         print("No channels returned. Check your token and guild_id.")
         return
-
     by_category: dict[str, list] = {}
     for ch in channels:
         cat = ch["category"] or "(no category)"
         by_category.setdefault(cat, []).append(ch)
-
     print(f"\n{len(channels)} entries found (channels + threads):\n")
     for cat, chs in sorted(by_category.items()):
         print(f"  [{cat}]")
@@ -519,100 +496,116 @@ def cmd_channels(config: dict, conn: sqlite3.Connection):
 
 
 def cmd_init(config: dict, conn: sqlite3.Connection):
-    """First-run full export of all channels and forum threads."""
     print("=== Initial full export ===")
     print(f"Guild: {config['guild_id']}")
     print()
-
     channels = list_channels(config)
     if not channels:
         print("No channels found. Aborting.")
         return
-
     print(f"Found {len(channels)} entries (channels + threads), exporting all.")
     print()
-
     with tempfile.TemporaryDirectory() as tmpdir:
         total, _ = process_channels(channels, config, conn, Path(tmpdir), verbose=True)
-
     print(f"\nDone. {total} messages ingested into {config['db_path']}")
 
 
 def cmd_sync(config: dict, conn: sqlite3.Connection):
-    """Incremental sync: new messages only."""
-    print(f"=== Incremental sync — {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
-
-    channels = list_channels(config)
-    if not channels:
-        print("No channels found.")
-        return
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        total, updated = process_channels(channels, config, conn, Path(tmpdir), verbose=False)
-
+    print(f"=== Incremental sync \u2014 {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+    total, updated = run_sync(config, conn)
     if total == 0:
         print("  No new messages.")
     else:
         print(f"  +{total} messages across {updated} channels/threads")
 
 
+def cmd_daemon(config: dict, conn: sqlite3.Connection):
+    """
+    Long-running sync daemon.
+
+    Syncs on startup, then sleeps sync_interval_hours and repeats.
+    Writes a PID file so watchdog.sh can check if it's alive.
+    Token is fetched from OCI Vault (or config) once at startup;
+    to pick up a rotated token just kill the process and let the
+    watchdog restart it.
+    """
+    pid_file = Path(config["pid_file"])
+    interval = int(config["sync_interval_hours"]) * 3600
+
+    # Write PID file
+    pid_file.write_text(str(os.getpid()))
+    logging.info(f"Daemon started (PID {os.getpid()}), "
+                 f"sync interval {config['sync_interval_hours']}h, "
+                 f"PID file {pid_file}")
+
+    def _shutdown(signum, frame):
+        logging.info("Daemon shutting down.")
+        pid_file.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    try:
+        while True:
+            start = datetime.now()
+            logging.info(f"Sync starting at {start.strftime('%Y-%m-%d %H:%M')}")
+            try:
+                total, updated = run_sync(config, conn)
+                if total > 0:
+                    logging.info(f"Sync complete: +{total} messages across {updated} channels")
+                else:
+                    logging.info("Sync complete: no new messages")
+            except Exception as e:
+                logging.exception(f"Sync failed: {e}")
+
+            logging.info(f"Sleeping {config['sync_interval_hours']}h until next sync")
+            time.sleep(interval)
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
 def cmd_backfill(config: dict, conn: sqlite3.Connection):
     """
     One-time backfill of archived forum threads via the Discord API.
-
-    --include-threads only returns active threads. This command fetches
-    the complete list of archived threads for every known forum channel
-    directly from the Discord API, then exports any not yet in the archive.
     Safe to re-run: threads already in export_state are skipped.
     """
     print("=== Archived thread backfill ===")
-
     forum_rows = conn.execute(
         "SELECT channel_id, name, category FROM channels WHERE is_forum = 1"
     ).fetchall()
-
     if not forum_rows:
         print("No forum channels found in DB. Run --init or --sync first.")
         return
-
     known_threads = {
         row["channel_id"]
         for row in conn.execute("SELECT channel_id FROM export_state")
     }
-
     total_new_threads = 0
     total_new_messages = 0
-
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
-
         for forum in forum_rows:
             forum_id   = forum["channel_id"]
             forum_name = forum["name"]
             category   = forum["category"] or ""
             label      = f"[{category}] #{forum_name}" if category else f"#{forum_name}"
-
-            print(f"\n{label} — fetching archived threads via API...")
+            print(f"\n{label} \u2014 fetching archived threads via API...")
             archived = fetch_archived_threads(forum_id, config["token"])
-
             if not archived:
-                print(f"  No archived threads found (or API error).")
+                print("  No archived threads found (or API error).")
                 continue
-
             new_threads = [t for t in archived if t["thread_id"] not in known_threads]
             print(f"  {len(archived)} archived threads total, "
                   f"{len(new_threads)} not yet in archive.")
-
             for i, thread in enumerate(new_threads, 1):
                 tid   = thread["thread_id"]
                 tname = thread["name"]
                 print(f"  [{i:3}/{len(new_threads)}] #{tname} ... ", end="", flush=True)
-
                 json_path, _ = export_channel_raw(tid, None, tmp_path, config)
                 if json_path is None:
                     print("SKIPPED")
                     continue
-
                 try:
                     n = ingest_export(conn, json_path)
                     update_export_state(conn, tid)
@@ -625,41 +618,29 @@ def cmd_backfill(config: dict, conn: sqlite3.Connection):
                     logging.exception(f"Failed to ingest {json_path}")
                 finally:
                     json_path.unlink(missing_ok=True)
-
-                # Small delay to avoid hammering dcex back-to-back.
                 time.sleep(0.2)
-
     print(f"\nDone. {total_new_threads} threads, "
           f"{total_new_messages} messages added to {config['db_path']}")
 
 
 def cmd_stats(config: dict, conn: sqlite3.Connection):
-    """Print summary statistics about the archive."""
     total_msgs   = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     total_chan    = conn.execute("SELECT COUNT(*) FROM channels WHERE is_forum = 0 AND parent_channel_id IS NULL").fetchone()[0]
     total_forums  = conn.execute("SELECT COUNT(*) FROM channels WHERE is_forum = 1").fetchone()[0]
     total_threads = conn.execute("SELECT COUNT(*) FROM channels WHERE parent_channel_id IS NOT NULL").fetchone()[0]
     total_authors = conn.execute("SELECT COUNT(DISTINCT author_id) FROM messages").fetchone()[0]
-
     oldest = conn.execute("SELECT MIN(timestamp) FROM messages").fetchone()[0]
     newest = conn.execute("SELECT MAX(timestamp) FROM messages").fetchone()[0]
-
     print(f"\n=== Archive statistics ===")
     print(f"  Database:      {config['db_path']}")
     print(f"  Messages:      {total_msgs:,}")
     print(f"  Channels:      {total_chan}")
     print(f"  Forums:        {total_forums}  ({total_threads} threads archived)")
     print(f"  Authors:       {total_authors}")
-    print(f"  Date range:    {oldest[:10] if oldest else 'n/a'} → {newest[:10] if newest else 'n/a'}")
-
+    print(f"  Date range:    {oldest[:10] if oldest else 'n/a'} \u2192 {newest[:10] if newest else 'n/a'}")
     print(f"\n  Top channels/threads by message count:")
     rows = conn.execute("""
-        SELECT
-            c.name,
-            c.category,
-            c.is_forum,
-            p.name AS parent_name,
-            COUNT(*) AS n
+        SELECT c.name, c.category, c.is_forum, p.name AS parent_name, COUNT(*) AS n
         FROM messages m
         JOIN channels c ON c.channel_id = m.channel_id
         LEFT JOIN channels p ON p.channel_id = c.parent_channel_id
@@ -669,24 +650,19 @@ def cmd_stats(config: dict, conn: sqlite3.Connection):
     """).fetchall()
     for row in rows:
         if row["parent_name"]:
-            label = f"#{row['parent_name']} › {row['name']}"
+            label = f"#{row['parent_name']} \u203a {row['name']}"
         else:
             cat = f"[{row['category']}] " if row["category"] else ""
             label = f"{cat}#{row['name']}"
         print(f"    {row['n']:>6,}  {label}")
-
     print(f"\n  Top authors by message count:")
     rows = conn.execute("""
         SELECT author_name, COUNT(*) AS n
-        FROM messages
-        WHERE is_bot = 0
-        GROUP BY author_id
-        ORDER BY n DESC
-        LIMIT 10
+        FROM messages WHERE is_bot = 0
+        GROUP BY author_id ORDER BY n DESC LIMIT 10
     """).fetchall()
     for row in rows:
         print(f"    {row['n']:>6,}  {row['author_name']}")
-
     print()
 
 
@@ -699,14 +675,13 @@ def main():
         description="Archive a Discord server's messages to SQLite."
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--init",     action="store_true", help="First run: full export of all channels")
-    group.add_argument("--sync",     action="store_true", help="Incremental sync (new messages only)")
-    group.add_argument("--backfill", action="store_true", help="One-time: fetch all archived forum threads")
-    group.add_argument("--channels", action="store_true", help="List channels without exporting")
-    group.add_argument("--stats",    action="store_true", help="Show archive statistics")
-
-    parser.add_argument("--config", default="config.json",
-                        help="Path to config file (default: config.json)")
+    group.add_argument("--init",     action="store_true", help="First run: full export")
+    group.add_argument("--sync",     action="store_true", help="Incremental sync")
+    group.add_argument("--daemon",   action="store_true", help="Long-running sync loop")
+    group.add_argument("--backfill", action="store_true", help="Fetch archived forum threads")
+    group.add_argument("--channels", action="store_true", help="List channels")
+    group.add_argument("--stats",    action="store_true", help="Show statistics")
+    parser.add_argument("--config", default="config.json")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent
@@ -714,8 +689,12 @@ def main():
 
     logging.basicConfig(
         level=getattr(logging, config.get("log_level", "INFO")),
-        format="%(levelname)s: %(message)s"
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # Resolve token once here — all commands use config["token"] from this point.
+    config["token"] = resolve_token(config)
 
     db_path = script_dir / config["db_path"]
     conn = open_db(str(db_path))
@@ -727,6 +706,8 @@ def main():
             cmd_init(config, conn)
         elif args.sync:
             cmd_sync(config, conn)
+        elif args.daemon:
+            cmd_daemon(config, conn)
         elif args.backfill:
             cmd_backfill(config, conn)
         elif args.stats:

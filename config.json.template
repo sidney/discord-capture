@@ -1,8 +1,14 @@
 {
-    "token": "YOUR_DISCORD_USER_TOKEN",
     "guild_id": "YOUR_OB1_GUILD_ID",
+
+    "token": "YOUR_DISCORD_USER_TOKEN",
+
+    "vault_secret_ocid": "",
+
     "db_path": "discord_archive.db",
     "dcex_path": "dcex",
-    "exclude_channel_types": ["DirectTextChat", "DirectGroupTextChat"],
-    "log_level": "INFO"
+    "log_level": "INFO",
+
+    "sync_interval_hours": 12,
+    "pid_file": "/tmp/discord_archive.pid"
 }
