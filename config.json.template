@@ -1,0 +1,8 @@
+{
+    "token": "YOUR_DISCORD_USER_TOKEN",
+    "guild_id": "YOUR_OB1_GUILD_ID",
+    "db_path": "discord_archive.db",
+    "dcex_path": "dcex",
+    "exclude_channel_types": ["DirectTextChat", "DirectGroupTextChat"],
+    "log_level": "INFO"
+}

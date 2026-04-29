@@ -1,0 +1,26 @@
+# Database — contains your message archive, do not commit
+discord_archive.db
+*.db
+
+# Config — contains your Discord token, never commit
+config.json
+
+# Logs
+logs/
+*.log
+
+# DiscordChatExporter binary if downloaded locally
+dcex
+DiscordChatExporter.Cli
+
+# Temp export files
+*.json
+!config.json.template
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
