@@ -11,11 +11,19 @@ Appends results to the same artefact_linkages table in discord_archive.db,
 and regenerates the linkage_report files to include GitHub content.
 
 Usage:
-  export GITHUB_TOKEN=ghp_...
   python3 cluster_github.py [--db PATH] [--out-dir PATH] [--dry-run]
 
-The GitHub token needs only public repo read access (no special scopes needed
-for public repos, but a token avoids the 60 req/hr unauthenticated limit).
+Token resolution order (first match wins):
+  1. GITHUB_TOKEN environment variable
+  2. OCI Vault secret — OCID read from GITHUB_VAULT_SECRET_OCID env var,
+     or from github_vault_secret_ocid key in config.json (same file used
+     by discord_archive.py for the Discord token)
+  3. ~/.github_token plain file (local testing fallback)
+  4. No token — unauthenticated (60 req/hr, may hit rate limits)
+
+The token needs only public repo read access: a classic PAT with no scopes
+selected, or a fine-grained PAT with "Public Repositories (read-only)".
+Either gives 5000 req/hr on public repos with zero write capability.
 """
 
 import sqlite3
@@ -29,6 +37,58 @@ import urllib.request
 import urllib.error
 from collections import defaultdict
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Token resolution: env var → OCI Vault → plain file → empty
+# ---------------------------------------------------------------------------
+
+def get_token():
+    """Resolve GitHub token from the first available source."""
+
+    # 1. Environment variable (works for interactive use and CI)
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token:
+        return token
+
+    # 2. OCI Vault — same instance principal pattern as discord_archive.py
+    vault_ocid = os.environ.get("GITHUB_VAULT_SECRET_OCID", "")
+    if not vault_ocid:
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                vault_ocid = cfg.get("github_vault_secret_ocid", "")
+            except Exception:
+                pass
+
+    if vault_ocid:
+        try:
+            import oci
+            import base64
+            signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+            client = oci.secrets.SecretsClient({}, signer=signer)
+            bundle = client.get_secret_bundle(vault_ocid).data
+            token = base64.b64decode(
+                bundle.secret_bundle_content.content
+            ).decode().strip()
+            print("  [token] Resolved from OCI Vault")
+            return token
+        except ImportError:
+            print("  [token] oci package not available, skipping Vault")
+        except Exception as e:
+            print(f"  [token] OCI Vault fetch failed: {e}")
+
+    # 3. Plain file (Mac/local testing)
+    token_path = os.path.expanduser("~/.github_token")
+    if os.path.exists(token_path):
+        token = open(token_path).read().strip()
+        if token:
+            print("  [token] Resolved from ~/.github_token")
+            return token
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -790,11 +850,12 @@ def main():
     )
     args = parser.parse_args()
 
-    token = os.environ.get("GITHUB_TOKEN", "")
+    print("Resolving GitHub token...")
+    token = get_token()
     if not token:
-        print("Warning: GITHUB_TOKEN not set. Using unauthenticated API "
-              "(60 req/hr limit — may hit rate limits).")
-        print("Set it with: export GITHUB_TOKEN=ghp_...")
+        print("  [token] No token found — using unauthenticated API (60 req/hr).")
+        print("  Set GITHUB_TOKEN, add github_vault_secret_ocid to config.json,")
+        print("  or write a token to ~/.github_token")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
