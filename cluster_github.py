@@ -403,7 +403,7 @@ PRS_TO_FETCH = [
     46,   # REST API gateway
     55,   # update_thought + delete_thought
     82,   # MCP Tool Audit guide
-    86,   # life-engine + life-engine-video
+    90,   # schema-aware-routing
     98,   # ingestion jobs schema
     99,   # universal ingest primitives
     100,  # smart ingest edge function
