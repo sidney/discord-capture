@@ -65,6 +65,17 @@ EMBED_MODEL = "openai/text-embedding-3-small"
 EMBED_DIMS = 1536
 OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
 
+# Phrases that identify rename/deprecation notices rather than descriptions.
+# Paragraphs containing any of these are skipped as description candidates.
+DEPRECATION_SIGNALS = [
+    "historical",
+    "for continuity",
+    "renamed",
+    "no longer compatible",
+    "formerly",
+    "the old installed name",
+]
+
 
 # ---------------------------------------------------------------------------
 # Token resolution helpers
@@ -218,6 +229,11 @@ def _is_noise_line(line):
     return False
 
 
+def _is_admonition(text):
+    """Return True if text is a GitHub admonition marker like [!NOTE]."""
+    return bool(re.match(r'^\[!(NOTE|WARNING|IMPORTANT|TIP|CAUTION)\]', text))
+
+
 def parse_readme(text):
     """
     Extract structured fields from a README.md.
@@ -229,11 +245,10 @@ def parse_readme(text):
       embed_text  — tagline + ". " + description (used for the embedding)
 
     The description is the first paragraph that:
-      - is not a heading
-      - is not a blockquote
-      - is not a code fence or list item
-      - is not a table row
+      - is not a heading, blockquote, code fence, list item, or table row
       - is not noise (badges, HTML, attribution)
+      - is not an italic-only subtitle (*...*  or _..._)
+      - is not a rename/deprecation notice
       - has at least 40 characters after stripping markdown backticks
     """
     lines = text.splitlines()
@@ -242,8 +257,6 @@ def parse_readme(text):
     tagline = ""
     description = ""
 
-    # We scan line-by-line, accumulating paragraph buffers.
-    # A paragraph ends at a blank line.
     in_code_block = False
     in_details = False
     current_para_lines = []
@@ -252,11 +265,26 @@ def parse_readme(text):
     found_description = False
 
     def flush_para(para_lines):
-        """Try to use a paragraph buffer as the description."""
+        """Try to accept a paragraph buffer as the description."""
         nonlocal description, found_description
         if found_description:
             return
         text_block = " ".join(l.strip() for l in para_lines if l.strip())
+        if not text_block:
+            return
+
+        # Skip italic-only lines — these are subtitles, not prose descriptions.
+        # e.g. "*The write side of the Open Brain flywheel*"
+        if re.match(r'^\*[^*]+\*$', text_block) or re.match(r'^_[^_]+_$', text_block):
+            return
+
+        # Skip rename/deprecation notices — meta-notes about folder names,
+        # compatibility changes, or continuity remarks are not descriptions.
+        # e.g. "The repo keeps the historical `claudeception` folder..."
+        lower = text_block.lower()
+        if any(sig in lower for sig in DEPRECATION_SIGNALS):
+            return
+
         # Strip inline code backticks for length check only
         plain = re.sub(r'`[^`]*`', '', text_block).strip()
         if len(plain) >= 40:
@@ -276,7 +304,7 @@ def parse_readme(text):
         if in_code_block:
             continue
 
-        # Track <details> blocks — skip their contents (SQL expansions etc)
+        # Track <details> blocks — skip SQL expansions and similar
         if stripped.startswith("<details"):
             if current_para_lines:
                 flush_para(current_para_lines)
@@ -319,17 +347,14 @@ def parse_readme(text):
                 current_para_lines = []
             continue
 
-        # Blockquote — tagline candidate
-        if stripped.startswith("> ") and not found_tagline:
-            tagline = stripped[2:].strip()
+        # Blockquote — tagline candidate (first non-admonition blockquote only)
+        if stripped.startswith("> "):
+            content = stripped[2:].strip()
             # Strip leading/trailing bold/italic markers
-            tagline = re.sub(r'^[*_]+|[*_]+$', '', tagline).strip()
-            found_tagline = True
-            if current_para_lines:
-                flush_para(current_para_lines)
-                current_para_lines = []
-            continue
-        if stripped.startswith("> "):  # subsequent blockquotes
+            content = re.sub(r'^[*_]+|[*_]+$', '', content).strip()
+            if not found_tagline and not _is_admonition(content):
+                tagline = content
+                found_tagline = True
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
@@ -342,8 +367,8 @@ def parse_readme(text):
                 current_para_lines = []
             continue
 
-        # GitHub Admonition markers (> [!NOTE] etc) — skip
-        if re.match(r'^\[!(NOTE|WARNING|IMPORTANT|TIP|CAUTION)\]', stripped):
+        # GitHub admonition markers inside body text — skip
+        if _is_admonition(stripped):
             continue
 
         # If we already have a description, stop accumulating
