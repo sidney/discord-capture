@@ -9,30 +9,32 @@ against a hand-maintained vocabulary, pass 5 uses vector similarity:
      embeddings derived from README descriptions.
   2. Fetches ALL merged PRs and ALL issues from the OB1 GitHub repo — no
      static fetch list needed. New PRs appear automatically on the next run.
-  3. For each PR, fetches its GitHub timeline to find cross-referenced issues.
-     The body of any referencing issue is appended to the PR's embed text,
-     so that PRs with thin bodies (implementation-only) are enriched with
-     the conceptual discussion from the issue that motivated them.
-  4. Embeds each source document (title + body + enrichment) via OpenRouter.
-  5. Computes cosine similarity between each source embedding and every
-     artefact embedding.
-  6. Records matches above SIMILARITY_THRESHOLD as pass 5 rows in the
-     artefact_linkages table, with score = int(similarity * 100).
-  7. Regenerates the full linkage report including a pass 4 vs pass 5
-     comparison section.
+  3. For each PR, fetches its GitHub timeline to find cross-referenced issues
+     and appends their bodies to the PR's embed text (--no-enrich to skip).
+  4. Fetches comments on all issues and PRs as separate embeddable source
+     documents. Issue and PR comment threads function as a parallel technical
+     forum alongside Discord, particularly for older discussions that predate
+     Discord's forum migration. Each comment is embedded individually with
+     its parent title prepended for context (--no-comments to skip).
+  5. Embeds all source documents via OpenRouter.
+  6. Computes cosine similarity between each source embedding and every
+     artefact embedding. Records matches above threshold as pass-5 rows in
+     artefact_linkages, with score = int(similarity * 100).
+  7. Regenerates the full linkage report with pass 4 vs pass 5 comparison.
 
-Key validation target: schema-aware-routing should score >= 65 on PR #90
-after enrichment with issue #68's context, even though the PR body alone
-scores only 0.592.
+Key validation target: your VOCABULARY_CONFIG comment on issue #35 should
+score >= 0.65 against schema-aware-routing via comment embedding, even though
+the issue body itself is about a different topic (extension table design).
 
 Usage:
   python3 cluster_embed.py [--db PATH] [--catalogue PATH] [--out-dir PATH]
                             [--threshold FLOAT] [--dry-run] [--no-enrich]
-                            [--verbose]
+                            [--no-comments] [--verbose]
 
-  --no-enrich   Skip timeline cross-reference fetches. Faster, but PRs with
-                thin bodies won't be enriched. Useful for threshold tuning
-                experiments after a full enriched run has already been done.
+  --no-enrich    Skip PR timeline cross-reference fetches.
+  --no-comments  Skip issue and PR comment fetching. Much faster, but misses
+                 comment-thread discussions that are the conceptual home of
+                 some artefacts.
 
 Token resolution — GitHub:
   GITHUB_TOKEN env var → OCI Vault (github_vault_secret_ocid in config.json)
@@ -55,8 +57,6 @@ import urllib.error
 from collections import defaultdict
 from datetime import datetime, timezone
 
-# numpy is used for fast cosine similarity. Falls back to pure Python if
-# unavailable, at the cost of slower computation on large corpora.
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -77,25 +77,12 @@ GH_API_BASE = "https://api.github.com"
 OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
 EMBED_MODEL = "openai/text-embedding-3-small"
 
-# Minimum body length (chars) for a source document to be worth embedding.
 MIN_BODY_CHARS = 40
-
-# Maximum PR/issue body length to embed. ~3000 chars ≈ 750 tokens.
 MAX_BODY_CHARS = 3000
-
-# Cross-reference enrichment limits.
-# Each referenced issue contributes at most this many chars to the embed text.
 MAX_CROSSREF_BODY_CHARS = 600
-# Cap at this many cross-referenced issues per PR to avoid dilution.
 MAX_CROSSREFS_PER_PR = 3
-
-# Number of source documents per OpenRouter embedding API call.
 EMBED_BATCH_SIZE = 50
-
-# Default similarity threshold.
 DEFAULT_THRESHOLD = 0.65
-
-# Maximum artefact matches to record per source document.
 TOP_N_PER_SOURCE = 5
 
 
@@ -175,15 +162,8 @@ def get_openrouter_key():
 # ---------------------------------------------------------------------------
 
 def load_catalogue(catalogue_path):
-    """
-    Load ob1_catalogue.json and return a list of artefact dicts, each with:
-      slug, title, category, embed_text, embedding (list of floats)
-
-    Artefacts without embeddings are skipped with a warning.
-    """
     with open(catalogue_path, encoding="utf-8") as f:
         data = json.load(f)
-
     artefacts = []
     skipped = 0
     for a in data["artefacts"]:
@@ -198,7 +178,6 @@ def load_catalogue(catalogue_path):
             "embed_text": a["embed_text"],
             "embedding": a["embedding"],
         })
-
     print(f"Loaded {len(artefacts)} artefacts from catalogue"
           + (f" ({skipped} skipped, no embedding)" if skipped else ""))
     return artefacts
@@ -236,22 +215,19 @@ def gh_get(path, token, params=None):
         return None
 
 
+def _is_bot(login):
+    """Return True for GitHub bot accounts whose comments are not human discussion."""
+    return login.endswith("[bot]") or login in ("ghost",)
+
+
 # ---------------------------------------------------------------------------
-# Cross-reference enrichment via GitHub timeline API
+# Cross-reference enrichment
 # ---------------------------------------------------------------------------
 
 def fetch_pr_cross_refs(pr_num, token):
     """
     Fetch cross-referenced issues for a PR via the GitHub timeline API.
-
-    GitHub adds a 'cross-referenced' event to a PR's timeline whenever
-    another issue or PR mentions it. We extract only those cross-references
-    that come from real issues (not other PRs), up to MAX_CROSSREFS_PER_PR.
-
-    Returns a list of dicts: {num, title, body} for each referencing issue.
-    The body can be used to enrich the PR's embed text with the conceptual
-    discussion that motivated the PR — covering the case where the PR body
-    is implementation-only and thin on conceptual vocabulary.
+    Returns list of {num, title, body} for referencing real issues (not PRs).
     """
     timeline = gh_get(
         f"/repos/{GH_OWNER}/{GH_REPO}/issues/{pr_num}/timeline",
@@ -260,7 +236,6 @@ def fetch_pr_cross_refs(pr_num, token):
     )
     if not timeline or not isinstance(timeline, list):
         return []
-
     refs = []
     seen_nums = set()
     for event in timeline:
@@ -270,36 +245,30 @@ def fetch_pr_cross_refs(pr_num, token):
         if source.get("type") != "issue":
             continue
         issue = source.get("issue", {})
-        # Skip if the cross-referencing source is itself a PR
         if "pull_request" in issue:
             continue
         num = issue.get("number")
         if not num or num in seen_nums:
             continue
         seen_nums.add(num)
-        title = issue.get("title", "")
-        body = (issue.get("body") or "").strip()
-        refs.append({"num": num, "title": title, "body": body})
+        refs.append({
+            "num": num,
+            "title": issue.get("title", ""),
+            "body": (issue.get("body") or "").strip(),
+        })
         if len(refs) >= MAX_CROSSREFS_PER_PR:
             break
-
     return refs
 
 
 # ---------------------------------------------------------------------------
-# GitHub source fetching
+# GitHub source fetching: bodies
 # ---------------------------------------------------------------------------
 
 def fetch_all_merged_prs(token, enrich=True, verbose=False):
     """
-    Fetch all merged PRs from the OB1 repo via paginated API.
-
-    When enrich=True (default), fetches each PR's timeline to find
-    cross-referenced issues and appends their bodies to the embed text.
-    PRs enriched this way use match_basis 'embed_pr_enriched' rather than
-    'embed_pr_body', so the report can distinguish the two cases.
-
-    Returns a list of source dicts ready for embedding.
+    Fetch all merged PRs. When enrich=True, appends cross-referenced issue
+    bodies to the embed text and sets match_basis to 'embed_pr_enriched'.
     """
     prs = []
     page = 1
@@ -311,42 +280,36 @@ def fetch_all_merged_prs(token, enrich=True, verbose=False):
         )
         if not batch or not isinstance(batch, list):
             break
-
         for pr in batch:
             if not pr.get("merged_at"):
                 continue
             num = pr["number"]
             title = pr.get("title", "")
             body = (pr.get("body") or "").strip()
-            combined = f"{title}\n{body}"
-            if len(combined) < MIN_BODY_CHARS:
+            if len(f"{title}\n{body}") < MIN_BODY_CHARS:
                 continue
 
             embed_text = f"{title}\n{body[:MAX_BODY_CHARS]}"
             github_refs = [f"PR#{num}"]
             match_basis = "embed_pr_body"
 
-            # Fetch cross-referenced issues and enrich embed text
             if enrich:
                 cross_refs = fetch_pr_cross_refs(num, token)
                 time.sleep(0.2)
                 if cross_refs:
-                    enrichment_parts = []
+                    parts = []
                     for ref in cross_refs:
                         ref_text = f"Referenced by issue #{ref['num']}: {ref['title']}"
                         if ref["body"]:
                             ref_text += f"\n{ref['body'][:MAX_CROSSREF_BODY_CHARS]}"
-                        enrichment_parts.append(ref_text)
+                        parts.append(ref_text)
                         github_refs.append(f"issue#{ref['num']}")
-                    embed_text = (
-                        f"{title}\n{body[:MAX_BODY_CHARS]}\n\n"
-                        + "\n\n".join(enrichment_parts)
-                    )
+                    embed_text = f"{title}\n{body[:MAX_BODY_CHARS]}\n\n" + "\n\n".join(parts)
                     match_basis = "embed_pr_enriched"
 
             if verbose:
-                enriched_str = f" [+{len(github_refs)-1} refs]" if len(github_refs) > 1 else ""
-                print(f"    PR #{num}{enriched_str}: {title[:60]}")
+                tag = f" [+{len(github_refs)-1} refs]" if len(github_refs) > 1 else ""
+                print(f"    PR #{num}{tag}: {title[:60]}")
 
             prs.append({
                 "num": num,
@@ -361,20 +324,15 @@ def fetch_all_merged_prs(token, enrich=True, verbose=False):
                 "match_basis": match_basis,
                 "github_refs": github_refs,
             })
-
         if len(batch) < 100:
             break
         page += 1
         time.sleep(0.3)
-
     return prs
 
 
 def fetch_all_issues(token, verbose=False):
-    """
-    Fetch all real issues (excluding PRs) from the OB1 repo.
-    Returns a list of source dicts ready for embedding.
-    """
+    """Fetch all real issues (excluding PRs) from the OB1 repo."""
     issues = []
     page = 1
     while True:
@@ -385,15 +343,13 @@ def fetch_all_issues(token, verbose=False):
         )
         if not batch or not isinstance(batch, list):
             break
-
         for issue in batch:
             if "pull_request" in issue:
                 continue
             num = issue["number"]
             title = issue.get("title", "")
             body = (issue.get("body") or "").strip()
-            combined = f"{title}\n{body}"
-            if len(combined) < MIN_BODY_CHARS:
+            if len(f"{title}\n{body}") < MIN_BODY_CHARS:
                 continue
             if verbose:
                 print(f"    issue #{num}: {title[:60]}")
@@ -410,13 +366,118 @@ def fetch_all_issues(token, verbose=False):
                 "match_basis": "embed_issue_body",
                 "github_refs": [f"issue#{num}"],
             })
-
         if len(batch) < 100:
             break
         page += 1
         time.sleep(0.3)
-
     return issues
+
+
+# ---------------------------------------------------------------------------
+# GitHub source fetching: comments
+# ---------------------------------------------------------------------------
+
+def _comments_as_sources(parent_num, parent_title, parent_ref,
+                          parent_channel_name, match_basis, comments):
+    """
+    Convert a list of GitHub comment objects into embeddable source dicts.
+    Each non-bot comment with sufficient body length becomes its own source.
+    The parent title is prepended to give the embedding model context.
+    """
+    sources = []
+    for comment in comments:
+        login = comment.get("user", {}).get("login", "")
+        if _is_bot(login):
+            continue
+        body = (comment.get("body") or "").strip()
+        if len(body) < MIN_BODY_CHARS:
+            continue
+        sources.append({
+            "num": parent_num,
+            "ref": parent_ref,
+            "title": parent_title,
+            "body": body,
+            # Prepend parent title so the embedding reflects the discussion topic,
+            # not just the comment text in isolation.
+            "embed_text": f"{parent_title}\n{body[:MAX_BODY_CHARS]}",
+            "created_at": comment.get("created_at", ""),
+            "author": login,
+            "state": "",
+            "channel_name": parent_channel_name,
+            "match_basis": match_basis,
+            "github_refs": [parent_ref],
+        })
+    return sources
+
+
+def fetch_issue_comments(issues, token, verbose=False):
+    """
+    For each issue already fetched, retrieve its comment thread and return
+    each comment as a separate embeddable source document.
+
+    Issue comment threads are a primary venue for technical discussion in OB1,
+    particularly for issues that predate Discord's forum migration. Comments
+    often contain the conceptual vocabulary that the issue body lacks.
+    """
+    all_comment_sources = []
+    for issue in issues:
+        num = issue["num"]
+        comments = gh_get(
+            f"/repos/{GH_OWNER}/{GH_REPO}/issues/{num}/comments",
+            token,
+            params={"per_page": 100},
+        )
+        time.sleep(0.2)
+        if not comments or not isinstance(comments, list):
+            continue
+        sources = _comments_as_sources(
+            parent_num=num,
+            parent_title=issue["title"],
+            parent_ref=f"issue#{num}",
+            parent_channel_name=issue["channel_name"],
+            match_basis="embed_issue_comment",
+            comments=comments,
+        )
+        if verbose and sources:
+            print(f"    issue #{num}: {len(sources)} comments")
+        all_comment_sources.extend(sources)
+    return all_comment_sources
+
+
+def fetch_pr_comments(prs, token, verbose=False):
+    """
+    For each PR already fetched, retrieve its discussion comment thread
+    (not inline review comments) and return each comment as a separate
+    embeddable source document.
+
+    PR discussion comments capture review conversations, design clarifications,
+    and community reactions that don't appear in the PR body.
+    """
+    all_comment_sources = []
+    for pr in prs:
+        num = pr["num"]
+        # /issues/{num}/comments gives the discussion thread (not code review
+        # inline comments, which live at /pulls/{num}/comments).
+        comments = gh_get(
+            f"/repos/{GH_OWNER}/{GH_REPO}/issues/{num}/comments",
+            token,
+            params={"per_page": 100},
+        )
+        time.sleep(0.2)
+        if not comments or not isinstance(comments, list):
+            continue
+        sources = _comments_as_sources(
+            parent_num=num,
+            parent_title=pr["title"],
+            parent_ref=f"PR#{num}",
+            parent_channel_name=pr["channel_name"],
+            match_basis="embed_pr_comment",
+            comments=comments,
+        )
+        if verbose and sources:
+            print(f"    PR #{num}: {len(sources)} comments")
+        all_comment_sources.extend(sources)
+    return all_comment_sources
 
 
 # ---------------------------------------------------------------------------
@@ -424,10 +485,6 @@ def fetch_all_issues(token, verbose=False):
 # ---------------------------------------------------------------------------
 
 def embed_batch(texts, api_key):
-    """
-    Embed a list of texts via OpenRouter. Returns a list of vectors (lists of
-    floats) in the same order. Returns None values on failure.
-    """
     payload = json.dumps({"model": EMBED_MODEL, "input": texts}).encode()
     req = urllib.request.Request(OPENROUTER_EMBED_URL, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -443,10 +500,6 @@ def embed_batch(texts, api_key):
 
 
 def embed_all_sources(sources, api_key):
-    """
-    Embed all source documents in batches. Attaches embedding in-place.
-    Returns the number of successful embeddings.
-    """
     total = len(sources)
     success = 0
     for i in range(0, total, EMBED_BATCH_SIZE):
@@ -467,7 +520,6 @@ def embed_all_sources(sources, api_key):
 # ---------------------------------------------------------------------------
 
 def precompute_artefact_norms(artefacts):
-    """Normalise all artefact embeddings once. Attaches embedding_norm in-place."""
     if HAS_NUMPY:
         mat = np.array([a["embedding"] for a in artefacts], dtype=np.float32)
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
@@ -486,20 +538,13 @@ def precompute_artefact_norms(artefacts):
 # ---------------------------------------------------------------------------
 
 def compute_matches(sources, artefacts, threshold, verbose=False):
-    """
-    For each source document with a valid embedding, compute cosine similarity
-    against all artefact embeddings. Record top matches above threshold.
-    Returns a list of linkage row dicts.
-    """
     results = []
     skipped = 0
-
     for source in sources:
         vec = source.get("embedding")
         if vec is None:
             skipped += 1
             continue
-
         if HAS_NUMPY:
             svec = np.array(vec, dtype=np.float32)
             snorm = np.linalg.norm(svec)
@@ -514,7 +559,8 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
         scored = []
         for a in artefacts:
             anorm = a["embedding_norm"]
-            sim = float(np.dot(svec_norm, anorm)) if HAS_NUMPY else sum(x * y for x, y in zip(svec_norm, anorm))
+            sim = (float(np.dot(svec_norm, anorm)) if HAS_NUMPY
+                   else sum(x * y for x, y in zip(svec_norm, anorm)))
             if sim >= threshold:
                 scored.append((a, sim))
 
@@ -522,8 +568,8 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
         top = scored[:TOP_N_PER_SOURCE]
 
         if verbose and top:
-            enriched = " [enriched]" if source["match_basis"] == "embed_pr_enriched" else ""
-            print(f"    {source['ref']}{enriched}: {len(top)} matches — top: "
+            tag = f" [{source['match_basis']}]" if "comment" in source["match_basis"] else ""
+            print(f"    {source['ref']}{tag}: {len(top)} matches — top: "
                   f"{top[0][0]['slug']} ({top[0][1]:.3f})")
 
         for a, sim in top:
@@ -547,7 +593,6 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
 
     if skipped:
         print(f"  [warn] {skipped} source(s) skipped (no embedding)")
-
     return results
 
 
@@ -556,7 +601,6 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
 # ---------------------------------------------------------------------------
 
 def write_to_db(conn, results, dry_run=False):
-    """Replace all pass-5 rows and insert new results."""
     if dry_run:
         print(f"[dry-run] Would write {len(results)} pass-5 rows to artefact_linkages")
         return
@@ -583,24 +627,45 @@ def write_to_db(conn, results, dry_run=False):
 # Validation
 # ---------------------------------------------------------------------------
 
-def print_pr90_validation(results, pass4_rows=None):
-    """Print schema-aware-routing score on PR #90 for both methods."""
+def print_validation(results, pass4_rows=None):
+    """
+    Print schema-aware-routing scores on PR #90 and issue #35 for both
+    methods, as the two canonical validation cases:
+
+    PR #90  — implementation PR with thin body; conceptual content in comments
+    issue #35 — body is about extension design; VOCABULARY_CONFIG comment is
+                 the actual schema-aware-routing conceptual home
+    """
     slug = "schema-aware-routing"
-    print("\n--- Validation: schema-aware-routing on PR #90 ---")
-    embed_match = next(
+    print("\n--- Validation: schema-aware-routing ---")
+
+    # PR #90
+    pr90 = next(
         (r for r in results
          if r["artefact_slug"] == slug and "PR#90" in r["github_refs"]),
         None,
     )
-    if embed_match:
-        sim = embed_match.get("similarity", embed_match["score"] / 100)
-        basis = embed_match["match_basis"]
-        print(f"  Pass 5 ({basis}): score={embed_match['score']}, similarity={sim:.4f}  ✓")
-        if len(embed_match["github_refs"]) > 1:
-            print(f"  Enriched with: {', '.join(embed_match['github_refs'][1:])}")
+    if pr90:
+        sim = pr90.get("similarity", pr90["score"] / 100)
+        print(f"  PR #90  pass 5 ({pr90['match_basis']}): score={pr90['score']}, sim={sim:.4f}  ✓")
+        if len(pr90["github_refs"]) > 1:
+            print(f"          enriched with: {', '.join(pr90['github_refs'][1:])}")
     else:
-        print(f"  Pass 5 (embed): no match above threshold")
+        print(f"  PR #90  pass 5: no match above threshold")
 
+    # issue #35 — any source type
+    issue35_matches = [
+        r for r in results
+        if r["artefact_slug"] == slug and "issue#35" in r["github_refs"]
+    ]
+    if issue35_matches:
+        best = max(issue35_matches, key=lambda x: x["score"])
+        sim = best.get("similarity", best["score"] / 100)
+        print(f"  issue #35 pass 5 ({best['match_basis']}): score={best['score']}, sim={sim:.4f}  ✓")
+    else:
+        print(f"  issue #35 pass 5: no match above threshold")
+
+    # Pass 4 term score for comparison
     if pass4_rows is not None:
         term_match = next(
             (r for r in pass4_rows
@@ -608,8 +673,8 @@ def print_pr90_validation(results, pass4_rows=None):
              and "PR#90" in str(r.get("github_refs", ""))),
             None,
         )
-        print(f"  Pass 4 (term):  score={term_match['score']}" if term_match
-              else "  Pass 4 (term):  score=0 or 1")
+        print(f"  PR #90  pass 4 (term): score={term_match['score']}" if term_match
+              else "  PR #90  pass 4 (term): score=0 or 1")
     print()
 
 
@@ -638,8 +703,9 @@ def regenerate_reports(conn, out_dir, pass5_results=None):
 
     csv_path = os.path.join(out_dir, "linkage_report_full.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=fields).writeheader()
-        csv.DictWriter(f, fieldnames=fields).writerows(results)
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(results)
     print(f"Written: {csv_path}")
 
     md_path = os.path.join(out_dir, "linkage_report_full.md")
@@ -666,7 +732,7 @@ def _write_markdown(results, sim_lookup, path):
     lines.append("")
     lines.append("Score columns: Discord (passes 1-3, term) | GitHub term (pass 4) | GitHub embed (pass 5).")
     lines.append("Pass 5 scores are similarity × 100 — not directly comparable to term scores.")
-    lines.append("match_basis 'embed_pr_enriched' = PR body + cross-referenced issue context.")
+    lines.append("match_basis: embed_pr_body | embed_pr_enriched | embed_pr_comment | embed_issue_body | embed_issue_comment")
     lines.append("")
 
     lines.append("## Artefacts by embedding score (pass 5)")
@@ -712,18 +778,24 @@ def _write_markdown(results, sim_lookup, path):
         )
     lines.append("")
 
-    lines.append("## Validation: schema-aware-routing on PR #90")
+    lines.append("## Validation: schema-aware-routing on PR #90 and issue #35")
     lines.append("")
     sar = by_artefact.get("schema-aware-routing", [])
     pr90e = next((e for e in sar if e["pass"] == 5 and "PR#90" in str(e.get("github_refs", ""))), None)
+    i35e  = next((e for e in sar if e["pass"] == 5 and "issue#35" in str(e.get("github_refs", ""))), None)
     pr90t = next((e for e in sar if e["pass"] == 4 and "PR#90" in str(e.get("github_refs", ""))), None)
     if pr90e:
-        sim = sim_lookup.get((pr90e["channel_name"], "schema-aware-routing"), pr90e["score"] / 100)
-        lines.append(f"- Pass 5 ({pr90e['match_basis']}): score={pr90e['score']}, similarity={sim:.4f}")
+        sim = sim_lookup.get((pr90e["channel_name"], slug), pr90e["score"] / 100)
+        lines.append(f"- PR #90  pass 5 ({pr90e['match_basis']}): score={pr90e['score']}, sim={sim:.4f}")
     else:
-        lines.append("- Pass 5 (embed): **no match above threshold**")
-    lines.append(f"- Pass 4 (term): score={pr90t['score']}" if pr90t
-                 else "- Pass 4 (term): score=0 or 1")
+        lines.append("- PR #90  pass 5: **no match above threshold**")
+    if i35e:
+        sim = sim_lookup.get((i35e["channel_name"], slug), i35e["score"] / 100)
+        lines.append(f"- issue #35 pass 5 ({i35e['match_basis']}): score={i35e['score']}, sim={sim:.4f}")
+    else:
+        lines.append("- issue #35 pass 5: **no match above threshold**")
+    lines.append(f"- PR #90  pass 4 (term): score={pr90t['score']}" if pr90t
+                 else "- PR #90  pass 4 (term): score=0 or 1")
     lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
@@ -741,14 +813,13 @@ def main():
     parser.add_argument("--db", default=os.path.expanduser("~/discord-capture/discord_archive.db"))
     parser.add_argument("--catalogue", default=os.path.expanduser("~/discord-capture/ob1_catalogue.json"))
     parser.add_argument("--out-dir", default=os.path.expanduser("~/discord-output"))
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                        help=f"Cosine similarity threshold (default: {DEFAULT_THRESHOLD})")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Compute matches but skip writing to DB")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-enrich", action="store_true",
-                        help="Skip timeline cross-reference fetches (faster, less accurate)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print per-source match details")
+                        help="Skip PR timeline cross-reference fetches")
+    parser.add_argument("--no-comments", action="store_true",
+                        help="Skip issue and PR comment fetching")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     print("Resolving GitHub token...")
@@ -759,31 +830,42 @@ def main():
     print("Resolving OpenRouter key...")
     or_key = get_openrouter_key()
     if not or_key:
-        print("  ERROR: OpenRouter key required for embeddings. Cannot proceed.")
+        print("  ERROR: OpenRouter key required. Cannot proceed.")
         return
 
     print(f"\nLoading catalogue from {args.catalogue}...")
     artefacts = load_catalogue(args.catalogue)
     if not artefacts:
-        print("  ERROR: No artefacts with embeddings found. Run build_catalogue.py first.")
+        print("  ERROR: No artefacts with embeddings found.")
         return
     precompute_artefact_norms(artefacts)
-    print(f"  Artefact embeddings normalised.")
+    print("  Artefact embeddings normalised.")
 
     enrich = not args.no_enrich
-    if enrich:
-        print("\nFetching merged PRs from OB1 (with cross-reference enrichment)...")
-    else:
-        print("\nFetching merged PRs from OB1 (enrichment skipped)...")
+    print(f"\nFetching merged PRs {'(with cross-ref enrichment)' if enrich else '(enrichment skipped)'}...")
     prs = fetch_all_merged_prs(gh_token, enrich=enrich, verbose=args.verbose)
     n_enriched = sum(1 for p in prs if p["match_basis"] == "embed_pr_enriched")
-    print(f"  {len(prs)} merged PRs fetched ({n_enriched} enriched with cross-ref context)")
+    print(f"  {len(prs)} merged PRs ({n_enriched} enriched with cross-ref context)")
 
-    print("\nFetching issues from OB1...")
+    print("\nFetching issues...")
     issues = fetch_all_issues(gh_token, verbose=args.verbose)
     print(f"  {len(issues)} issues fetched")
 
     sources = prs + issues
+
+    if not args.no_comments:
+        print("\nFetching issue comments...")
+        issue_comments = fetch_issue_comments(issues, gh_token, verbose=args.verbose)
+        print(f"  {len(issue_comments)} issue comments fetched")
+
+        print("\nFetching PR discussion comments...")
+        pr_comments = fetch_pr_comments(prs, gh_token, verbose=args.verbose)
+        print(f"  {len(pr_comments)} PR comments fetched")
+
+        sources = sources + issue_comments + pr_comments
+    else:
+        print("\nSkipping comment fetching (--no-comments).")
+
     print(f"\nTotal sources: {len(sources)}")
 
     print(f"\nEmbedding {len(sources)} source documents (batch size {EMBED_BATCH_SIZE})...")
@@ -801,7 +883,7 @@ def main():
             "SELECT artefact_slug, score, github_refs FROM artefact_linkages WHERE pass=4"
         ).fetchall()
     ]
-    print_pr90_validation(results, pass4_rows)
+    print_validation(results, pass4_rows)
 
     write_to_db(conn, results, dry_run=args.dry_run)
 
