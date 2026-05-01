@@ -19,22 +19,37 @@ against a hand-maintained vocabulary, pass 5 uses vector similarity:
   5. Embeds all source documents via OpenRouter.
   6. Computes cosine similarity between each source embedding and every
      artefact embedding. Records matches above threshold as pass-5 rows in
-     artefact_linkages, with score = int(similarity * 100).
-  7. Regenerates the full linkage report with pass 4 vs pass 5 comparison.
+     artefact_linkages, with score = int(similarity * 100). Thresholds can
+     vary by artefact category — see CATEGORY_THRESHOLDS — so e.g. matches
+     against architecture-category artefacts use a lower acceptance bar to
+     surface conceptual near-misses that strict 0.65 matching would hide.
+  7. For every source, records its single best pass-5 similarity regardless
+     of threshold (best_pass5_sim). Sources that match no artefact above
+     their per-category threshold appear in an "Orphan candidates" section
+     of the report so genuinely novel community contributions remain
+     visible rather than being silently dropped.
+  8. Regenerates the full linkage report with pass 4 vs pass 5 comparison
+     and an orphan-candidates section.
 
-Key validation target: your VOCABULARY_CONFIG comment on issue #35 should
-score >= 0.65 against schema-aware-routing via comment embedding, even though
-the issue body itself is about a different topic (extension table design).
+Validation: PR #90 and issue #35 (and its VOCABULARY_CONFIG comment) are
+canonical test cases. Their pass-5 similarity to schema-aware-routing is
+reported in the validation block whether above or below threshold; if
+below, they appear in the orphan candidates section instead. Either way
+they remain visible.
 
 Usage:
   python3 cluster_embed.py [--db PATH] [--catalogue PATH] [--out-dir PATH]
-                            [--threshold FLOAT] [--dry-run] [--no-enrich]
-                            [--no-comments] [--verbose]
+                            [--threshold FLOAT] [--threshold-architecture FLOAT]
+                            [--dry-run] [--no-enrich] [--no-comments] [--verbose]
 
-  --no-enrich    Skip PR timeline cross-reference fetches.
-  --no-comments  Skip issue and PR comment fetching. Much faster, but misses
-                 comment-thread discussions that are the conceptual home of
-                 some artefacts.
+  --threshold              Base threshold for pass-5 matches (default 0.65).
+  --threshold-architecture Threshold override for architecture-category
+                           artefacts (default 0.55). Set to the same value
+                           as --threshold to disable the category override.
+  --no-enrich              Skip PR timeline cross-reference fetches.
+  --no-comments            Skip issue and PR comment fetching. Much faster,
+                           but misses comment-thread discussions that are
+                           the conceptual home of some artefacts.
 
 Token resolution — GitHub:
   GITHUB_TOKEN env var → OCI Vault (github_vault_secret_ocid in config.json)
@@ -84,6 +99,26 @@ MAX_CROSSREFS_PER_PR = 3
 EMBED_BATCH_SIZE = 50
 DEFAULT_THRESHOLD = 0.65
 TOP_N_PER_SOURCE = 5
+
+# Per-category threshold overrides for pass-5 acceptance. A match against
+# an artefact is included in the linkage table iff its similarity is at
+# least the threshold for that artefact's category, falling back to the
+# base threshold (--threshold, default DEFAULT_THRESHOLD) for any category
+# not listed here.
+#
+# Architecture entries (the FAQ chunks, tool-audit, chunking-discussion)
+# match against community discussion using softer conceptual overlap rather
+# than direct topic vocabulary. A lower threshold for that category lets
+# borderline conceptual matches surface so the report can show them; the
+# base 0.65 stays in effect for everything else, so regular artefact
+# matching is not made noisier.
+DEFAULT_CATEGORY_THRESHOLDS = {
+    "architecture": 0.55,
+}
+
+# Cap for the orphan-candidates section in the markdown report. Sources
+# above this cap are written to source_stats.json but not to the markdown.
+ORPHAN_REPORT_CAP = 30
 
 
 # ---------------------------------------------------------------------------
@@ -537,31 +572,66 @@ def precompute_artefact_norms(artefacts):
 # Match computation
 # ---------------------------------------------------------------------------
 
-def compute_matches(sources, artefacts, threshold, verbose=False):
+def compute_matches(sources, artefacts, threshold,
+                    category_thresholds=None, verbose=False):
+    """Compute pass-5 matches and per-source stats.
+
+    For each source, computes cosine similarity against every artefact and:
+      - Accepts matches whose similarity is >= the category-specific
+        threshold (falling back to the base `threshold` when the artefact's
+        category has no override in `category_thresholds`).
+      - Records the single best similarity across all artefacts (regardless
+        of any threshold) for the orphan-candidates view.
+
+    Returns (results, source_stats):
+      results — list of accepted match rows for the linkage table (one row
+                per accepted source-artefact pair, capped at TOP_N_PER_SOURCE
+                per source).
+      source_stats — list with one record per source containing best pass-5
+                similarity, the artefact it best-matched, and whether
+                anything was accepted above threshold.
+    """
+    category_thresholds = category_thresholds or {}
     results = []
+    source_stats = []
     skipped = 0
+
     for source in sources:
         vec = source.get("embedding")
         if vec is None:
             skipped += 1
+            source_stats.append(_orphan_stat_for(source, None, None, False))
             continue
         if HAS_NUMPY:
             svec = np.array(vec, dtype=np.float32)
             snorm = np.linalg.norm(svec)
             if snorm == 0:
                 skipped += 1
+                source_stats.append(_orphan_stat_for(source, None, None, False))
                 continue
             svec_norm = svec / snorm
         else:
             norm = sum(x * x for x in vec) ** 0.5
             svec_norm = [x / norm for x in vec] if norm > 0 else vec
 
-        scored = []
+        # Score this source against every artefact, tracking accepted matches
+        # (above per-category threshold) and the global best (regardless of
+        # threshold) in a single pass.
+        scored = []                # (artefact, sim) for accepted matches
+        best_sim = None            # best similarity over ALL artefacts
+        best_artefact = None       # artefact for that best similarity
+
         for a in artefacts:
             anorm = a["embedding_norm"]
             sim = (float(np.dot(svec_norm, anorm)) if HAS_NUMPY
                    else sum(x * y for x, y in zip(svec_norm, anorm)))
-            if sim >= threshold:
+
+            if best_sim is None or sim > best_sim:
+                best_sim = sim
+                best_artefact = a
+
+            cat_threshold = category_thresholds.get(a["category"], threshold)
+            if sim >= cat_threshold:
                 scored.append((a, sim))
 
         scored.sort(key=lambda x: -x[1])
@@ -591,9 +661,39 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
                 "sample_text": source["body"][:400],
             })
 
+        source_stats.append(_orphan_stat_for(
+            source,
+            best_sim,
+            best_artefact,
+            matched=bool(top),
+        ))
+
     if skipped:
         print(f"  [warn] {skipped} source(s) skipped (no embedding)")
-    return results
+    return results, source_stats
+
+
+def _orphan_stat_for(source, best_sim, best_artefact, matched):
+    """Build a single per-source stats record for the orphan-tracking view.
+
+    `best_sim` and `best_artefact` may be None when the source had no
+    usable embedding (in which case `matched` is also False).
+    """
+    return {
+        "ref": source["ref"],
+        "channel_name": source["channel_name"],
+        "match_basis": source["match_basis"],
+        "author": source["author"],
+        "created_at": source["created_at"],
+        "github_refs": list(source["github_refs"]),
+        "best_pass5_sim": (round(best_sim, 4) if best_sim is not None else None),
+        "best_pass5_artefact": best_artefact["slug"] if best_artefact else None,
+        "best_pass5_artefact_category": (
+            best_artefact["category"] if best_artefact else None
+        ),
+        "matched_above_threshold": matched,
+        "sample_text": source["body"][:300],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +727,7 @@ def write_to_db(conn, results, dry_run=False):
 # Validation
 # ---------------------------------------------------------------------------
 
-def print_validation(results, pass4_rows=None):
+def print_validation(results, source_stats=None, pass4_rows=None):
     """
     Print schema-aware-routing scores on PR #90 and issue #35 for both
     methods, as the two canonical validation cases:
@@ -635,35 +735,59 @@ def print_validation(results, pass4_rows=None):
     PR #90  — implementation PR with thin body; conceptual content in comments
     issue #35 — body is about extension design; VOCABULARY_CONFIG comment is
                  the actual schema-aware-routing conceptual home
+
+    When a source has no accepted match, this still reports its best pass-5
+    similarity from source_stats so the validation block remains informative
+    rather than just saying "no match above threshold".
     """
     slug = "schema-aware-routing"
     print("\n--- Validation: schema-aware-routing ---")
 
-    # PR #90
-    pr90 = next(
-        (r for r in results
-         if r["artefact_slug"] == slug and "PR#90" in r["github_refs"]),
-        None,
-    )
-    if pr90:
-        sim = pr90.get("similarity", pr90["score"] / 100)
-        print(f"  PR #90  pass 5 ({pr90['match_basis']}): score={pr90['score']}, sim={sim:.4f}  ✓")
-        if len(pr90["github_refs"]) > 1:
-            print(f"          enriched with: {', '.join(pr90['github_refs'][1:])}")
-    else:
-        print(f"  PR #90  pass 5: no match above threshold")
+    stats_by_ref = {}
+    if source_stats:
+        for s in source_stats:
+            for ref in s["github_refs"]:
+                stats_by_ref.setdefault(ref, []).append(s)
 
-    # issue #35 — any source type
-    issue35_matches = [
-        r for r in results
-        if r["artefact_slug"] == slug and "issue#35" in r["github_refs"]
-    ]
-    if issue35_matches:
-        best = max(issue35_matches, key=lambda x: x["score"])
-        sim = best.get("similarity", best["score"] / 100)
-        print(f"  issue #35 pass 5 ({best['match_basis']}): score={best['score']}, sim={sim:.4f}  ✓")
-    else:
-        print(f"  issue #35 pass 5: no match above threshold")
+    def report_target(ref, label):
+        # Accepted match against schema-aware-routing, if any.
+        accepted = next(
+            (r for r in results
+             if r["artefact_slug"] == slug and ref in r["github_refs"]),
+            None,
+        )
+        if accepted:
+            sim = accepted.get("similarity", accepted["score"] / 100)
+            print(
+                f"  {label} pass 5 ({accepted['match_basis']}): "
+                f"score={accepted['score']}, sim={sim:.4f}  ✓"
+            )
+            if len(accepted["github_refs"]) > 1:
+                print(f"          enriched with: "
+                      f"{', '.join(accepted['github_refs'][1:])}")
+            return
+        # No accepted match — fall back to best pass-5 similarity over all
+        # artefacts (not just schema-aware-routing).
+        candidates = stats_by_ref.get(ref, [])
+        if not candidates:
+            print(f"  {label} pass 5: no source found")
+            return
+        best = max(
+            candidates,
+            key=lambda s: s["best_pass5_sim"] or -1.0,
+        )
+        sim = best["best_pass5_sim"]
+        if sim is None:
+            print(f"  {label} pass 5: no embedding available")
+            return
+        print(
+            f"  {label} pass 5: no match above threshold — "
+            f"best sim={sim:.4f} against {best['best_pass5_artefact']} "
+            f"(cat={best['best_pass5_artefact_category']}, basis={best['match_basis']})"
+        )
+
+    report_target("PR#90", "PR #90 ")
+    report_target("issue#35", "issue #35")
 
     # Pass 4 term score for comparison
     if pass4_rows is not None:
@@ -682,7 +806,7 @@ def print_validation(results, pass4_rows=None):
 # Report generation
 # ---------------------------------------------------------------------------
 
-def regenerate_reports(conn, out_dir, pass5_results=None):
+def regenerate_reports(conn, out_dir, pass5_results=None, source_stats=None):
     cur = conn.execute(
         """SELECT pass, match_basis, channel_name, category,
                   artefact_slug, artefact_title, artefact_category,
@@ -699,6 +823,12 @@ def regenerate_reports(conn, out_dir, pass5_results=None):
         for r in pass5_results:
             sim_lookup[(r["channel_name"], r["artefact_slug"])] = r.get("similarity", r["score"] / 100)
 
+    # Compute per-source pass-4 totals from the linkage rows we already
+    # have in memory. Match by github_refs, which is the only stable cross-
+    # pass identifier (channel_name format may vary between cluster_github.py
+    # and this module).
+    pass4_total_by_ref = _compute_pass4_totals_by_ref(results)
+
     os.makedirs(out_dir, exist_ok=True)
 
     csv_path = os.path.join(out_dir, "linkage_report_full.csv")
@@ -708,12 +838,51 @@ def regenerate_reports(conn, out_dir, pass5_results=None):
         w.writerows(results)
     print(f"Written: {csv_path}")
 
+    if source_stats is not None:
+        stats_path = os.path.join(out_dir, "source_stats.json")
+        # Annotate each source stat with its pass-4 total before writing.
+        annotated = []
+        for s in source_stats:
+            total = sum(pass4_total_by_ref.get(ref, 0) for ref in s["github_refs"])
+            annotated.append({**s, "pass4_total_score": total})
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "source_count": len(annotated),
+                "sources": annotated,
+            }, f, indent=2)
+        print(f"Written: {stats_path}")
+    else:
+        annotated = None
+
     md_path = os.path.join(out_dir, "linkage_report_full.md")
-    _write_markdown(results, sim_lookup, md_path)
+    _write_markdown(results, sim_lookup, md_path, source_stats=annotated)
     print(f"Written: {md_path}")
 
 
-def _write_markdown(results, sim_lookup, path):
+def _compute_pass4_totals_by_ref(rows):
+    """For each github ref appearing in pass-4 rows, sum the pass-4 scores.
+
+    Returns a dict mapping ref string ('PR#90', 'issue#35') → integer total.
+    A row whose github_refs JSON lists multiple refs contributes its score
+    to each of them, mirroring how pass-4 enrichment can attribute a single
+    match to a parent PR plus cross-referenced issues.
+    """
+    totals = defaultdict(int)
+    for r in rows:
+        if r["pass"] != 4:
+            continue
+        refs_raw = r.get("github_refs") or "[]"
+        try:
+            refs = json.loads(refs_raw) if isinstance(refs_raw, str) else refs_raw
+        except (json.JSONDecodeError, TypeError):
+            refs = []
+        for ref in refs:
+            totals[ref] += r["score"]
+    return dict(totals)
+
+
+def _write_markdown(results, sim_lookup, path, source_stats=None):
     by_artefact = defaultdict(list)
     for r in results:
         slug = r.get("artefact_slug")
@@ -729,9 +898,15 @@ def _write_markdown(results, sim_lookup, path):
     lines.append(f"Generated: {datetime.now().isoformat()}")
     lines.append(f"Total linkage rows: {len(results)}")
     lines.append(f"Artefacts matched: {len(by_artefact)}")
+    if source_stats is not None:
+        n_sources = len(source_stats)
+        n_orphans = sum(1 for s in source_stats if not s["matched_above_threshold"])
+        lines.append(f"Sources scanned: {n_sources}")
+        lines.append(f"Orphan sources (no pass-5 match above threshold): {n_orphans}")
     lines.append("")
     lines.append("Score columns: Discord (passes 1-3, term) | GitHub term (pass 4) | GitHub embed (pass 5).")
     lines.append("Pass 5 scores are similarity × 100 — not directly comparable to term scores.")
+    lines.append("Pass-5 acceptance threshold may vary by artefact category — see CATEGORY_THRESHOLDS.")
     lines.append("match_basis: embed_pr_body | embed_pr_enriched | embed_pr_comment | embed_issue_body | embed_issue_comment")
     lines.append("")
 
@@ -778,22 +953,107 @@ def _write_markdown(results, sim_lookup, path):
         )
     lines.append("")
 
+    # Orphan candidates: sources that didn't clear their per-category
+    # threshold. Sorted by best pass-5 similarity ascending so the most
+    # embedding-orphan items come first. Pass-4 total is shown alongside
+    # to distinguish "embedding-orphan but term-rich" (synthesis of known
+    # concepts in unfamiliar vocabulary) from "double-orphan" (genuinely
+    # novel content).
+    if source_stats is not None:
+        lines.append("## Orphan candidates")
+        lines.append("")
+        lines.append(
+            "Sources with no pass-5 match above their per-category threshold. "
+            "Sorted by best pass-5 similarity ascending — most embedding-orphan first."
+        )
+        lines.append("")
+        lines.append(
+            "Pass-4 total is the sum of all term-match scores attributed to "
+            "this source's GitHub ref(s) across all artefacts. High pass-4 + "
+            "low pass-5 suggests novel synthesis of existing concepts; low both "
+            "suggests genuinely new vocabulary."
+        )
+        lines.append("")
+
+        orphans = [s for s in source_stats if not s["matched_above_threshold"]]
+        # Sort: missing best_sim last (None → -inf for ascending sort needs
+        # special handling), then by best_sim ascending.
+        orphans.sort(
+            key=lambda s: (
+                s["best_pass5_sim"] is None,
+                s["best_pass5_sim"] if s["best_pass5_sim"] is not None else 0.0,
+            )
+        )
+
+        n_total = len(orphans)
+        if n_total == 0:
+            lines.append("_No orphan sources — every source matched something above threshold._")
+        else:
+            lines.append(
+                f"Showing {min(ORPHAN_REPORT_CAP, n_total)} of {n_total} orphan sources. "
+                f"Full data in `source_stats.json`."
+            )
+            lines.append("")
+            lines.append(
+                "| best pass-5 sim | best-match artefact (cat) | pass-4 total | basis | source |"
+            )
+            lines.append(
+                "|-----------------|---------------------------|--------------|-------|--------|"
+            )
+            for s in orphans[:ORPHAN_REPORT_CAP]:
+                sim = s["best_pass5_sim"]
+                sim_str = f"{sim:.3f}" if sim is not None else "—"
+                art = s["best_pass5_artefact"] or "—"
+                cat = s["best_pass5_artefact_category"] or "—"
+                p4 = s.get("pass4_total_score", 0)
+                ch = s["channel_name"]
+                lines.append(
+                    f"| {sim_str} | `{art}` ({cat}) | {p4} | "
+                    f"{s['match_basis']} | {ch} |"
+                )
+        lines.append("")
+
     lines.append("## Validation: schema-aware-routing on PR #90 and issue #35")
     lines.append("")
     sar = by_artefact.get("schema-aware-routing", [])
     pr90e = next((e for e in sar if e["pass"] == 5 and "PR#90" in str(e.get("github_refs", ""))), None)
     i35e  = next((e for e in sar if e["pass"] == 5 and "issue#35" in str(e.get("github_refs", ""))), None)
     pr90t = next((e for e in sar if e["pass"] == 4 and "PR#90" in str(e.get("github_refs", ""))), None)
-    if pr90e:
-        sim = sim_lookup.get((pr90e["channel_name"], slug), pr90e["score"] / 100)
-        lines.append(f"- PR #90  pass 5 ({pr90e['match_basis']}): score={pr90e['score']}, sim={sim:.4f}")
-    else:
-        lines.append("- PR #90  pass 5: **no match above threshold**")
-    if i35e:
-        sim = sim_lookup.get((i35e["channel_name"], slug), i35e["score"] / 100)
-        lines.append(f"- issue #35 pass 5 ({i35e['match_basis']}): score={i35e['score']}, sim={sim:.4f}")
-    else:
-        lines.append("- issue #35 pass 5: **no match above threshold**")
+
+    # Build a stats lookup for below-threshold reporting
+    stats_by_ref = defaultdict(list)
+    if source_stats is not None:
+        for s in source_stats:
+            for ref in s["github_refs"]:
+                stats_by_ref[ref].append(s)
+
+    def _validation_line(label, ref, accepted_entry):
+        """Generate a markdown bullet showing accepted-or-best-pass-5 for a target."""
+        if accepted_entry:
+            sim = sim_lookup.get(
+                (accepted_entry["channel_name"], "schema-aware-routing"),
+                accepted_entry["score"] / 100,
+            )
+            return (
+                f"- {label} pass 5 ({accepted_entry['match_basis']}): "
+                f"score={accepted_entry['score']}, sim={sim:.4f}"
+            )
+        # No accepted match — fall back to best pass-5 over any artefact.
+        candidates = stats_by_ref.get(ref, [])
+        if not candidates:
+            return f"- {label} pass 5: **no source found**"
+        best = max(candidates, key=lambda s: s["best_pass5_sim"] or -1.0)
+        sim = best["best_pass5_sim"]
+        if sim is None:
+            return f"- {label} pass 5: **no embedding available**"
+        return (
+            f"- {label} pass 5: **no match above threshold** — "
+            f"best sim={sim:.4f} against `{best['best_pass5_artefact']}` "
+            f"(cat={best['best_pass5_artefact_category']}, basis={best['match_basis']})"
+        )
+
+    lines.append(_validation_line("PR #90", "PR#90", pr90e))
+    lines.append(_validation_line("issue #35", "issue#35", i35e))
     lines.append(f"- PR #90  pass 4 (term): score={pr90t['score']}" if pr90t
                  else "- PR #90  pass 4 (term): score=0 or 1")
     lines.append("")
@@ -813,7 +1073,18 @@ def main():
     parser.add_argument("--db", default=os.path.expanduser("~/discord-capture/discord_archive.db"))
     parser.add_argument("--catalogue", default=os.path.expanduser("~/discord-capture/ob1_catalogue.json"))
     parser.add_argument("--out-dir", default=os.path.expanduser("~/discord-output"))
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                        help=f"Base pass-5 acceptance threshold (default {DEFAULT_THRESHOLD})")
+    parser.add_argument(
+        "--threshold-architecture",
+        type=float,
+        default=DEFAULT_CATEGORY_THRESHOLDS["architecture"],
+        help=(
+            "Threshold override for architecture-category artefacts "
+            f"(default {DEFAULT_CATEGORY_THRESHOLDS['architecture']}). "
+            "Set equal to --threshold to disable the override."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-enrich", action="store_true",
                         help="Skip PR timeline cross-reference fetches")
@@ -872,9 +1143,23 @@ def main():
     n_ok = embed_all_sources(sources, or_key)
     print(f"  {n_ok}/{len(sources)} embeddings successful")
 
-    print(f"\nComputing similarity (threshold={args.threshold})...")
-    results = compute_matches(sources, artefacts, args.threshold, verbose=args.verbose)
+    # Build per-category threshold dict from CLI args.
+    category_thresholds = dict(DEFAULT_CATEGORY_THRESHOLDS)
+    category_thresholds["architecture"] = args.threshold_architecture
+
+    print(f"\nComputing similarity:")
+    print(f"  base threshold = {args.threshold}")
+    for cat, t in sorted(category_thresholds.items()):
+        if t != args.threshold:
+            print(f"  category override: {cat} = {t}")
+    results, source_stats = compute_matches(
+        sources, artefacts, args.threshold,
+        category_thresholds=category_thresholds,
+        verbose=args.verbose,
+    )
     print(f"  {len(results)} matches recorded")
+    n_orphan = sum(1 for s in source_stats if not s["matched_above_threshold"])
+    print(f"  {n_orphan} of {len(source_stats)} sources had no match above threshold")
 
     conn = sqlite3.connect(args.db)
     pass4_rows = [
@@ -883,12 +1168,12 @@ def main():
             "SELECT artefact_slug, score, github_refs FROM artefact_linkages WHERE pass=4"
         ).fetchall()
     ]
-    print_validation(results, pass4_rows)
+    print_validation(results, source_stats=source_stats, pass4_rows=pass4_rows)
 
     write_to_db(conn, results, dry_run=args.dry_run)
 
     print("\nRegenerating reports...")
-    regenerate_reports(conn, args.out_dir, pass5_results=results)
+    regenerate_reports(conn, args.out_dir, pass5_results=results, source_stats=source_stats)
     conn.close()
 
     by_artefact = defaultdict(int)
@@ -900,6 +1185,7 @@ def main():
 
     print("\nDone. Fetch reports:")
     print(f"  scp ubuntu@144.24.44.81:{args.out_dir}/linkage_report_full.md ~/Desktop/")
+    print(f"  scp ubuntu@144.24.44.81:{args.out_dir}/source_stats.json ~/Desktop/")
 
 
 if __name__ == "__main__":
