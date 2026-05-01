@@ -9,21 +9,30 @@ against a hand-maintained vocabulary, pass 5 uses vector similarity:
      embeddings derived from README descriptions.
   2. Fetches ALL merged PRs and ALL issues from the OB1 GitHub repo — no
      static fetch list needed. New PRs appear automatically on the next run.
-  3. Embeds each source document (title + body) via OpenRouter.
-  4. Computes cosine similarity between each source embedding and every
+  3. For each PR, fetches its GitHub timeline to find cross-referenced issues.
+     The body of any referencing issue is appended to the PR's embed text,
+     so that PRs with thin bodies (implementation-only) are enriched with
+     the conceptual discussion from the issue that motivated them.
+  4. Embeds each source document (title + body + enrichment) via OpenRouter.
+  5. Computes cosine similarity between each source embedding and every
      artefact embedding.
-  5. Records matches above SIMILARITY_THRESHOLD as pass 5 rows in the
+  6. Records matches above SIMILARITY_THRESHOLD as pass 5 rows in the
      artefact_linkages table, with score = int(similarity * 100).
-  6. Regenerates the full linkage report including a pass 4 vs pass 5
+  7. Regenerates the full linkage report including a pass 4 vs pass 5
      comparison section.
 
 Key validation target: schema-aware-routing should score >= 65 on PR #90
-purely from embedding similarity, even though the PR body does not repeat
-the artefact's vocabulary terms.
+after enrichment with issue #68's context, even though the PR body alone
+scores only 0.592.
 
 Usage:
   python3 cluster_embed.py [--db PATH] [--catalogue PATH] [--out-dir PATH]
-                            [--threshold FLOAT] [--dry-run] [--verbose]
+                            [--threshold FLOAT] [--dry-run] [--no-enrich]
+                            [--verbose]
+
+  --no-enrich   Skip timeline cross-reference fetches. Faster, but PRs with
+                thin bodies won't be enriched. Useful for threshold tuning
+                experiments after a full enriched run has already been done.
 
 Token resolution — GitHub:
   GITHUB_TOKEN env var → OCI Vault (github_vault_secret_ocid in config.json)
@@ -69,19 +78,21 @@ OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
 EMBED_MODEL = "openai/text-embedding-3-small"
 
 # Minimum body length (chars) for a source document to be worth embedding.
-# Short bodies (bot comments, auto-merge messages) produce noisy embeddings.
 MIN_BODY_CHARS = 40
 
-# Maximum body length to embed. Truncated to avoid token limit issues.
-# ~3000 chars ≈ 750 tokens, well within text-embedding-3-small limits.
+# Maximum PR/issue body length to embed. ~3000 chars ≈ 750 tokens.
 MAX_BODY_CHARS = 3000
+
+# Cross-reference enrichment limits.
+# Each referenced issue contributes at most this many chars to the embed text.
+MAX_CROSSREF_BODY_CHARS = 600
+# Cap at this many cross-referenced issues per PR to avoid dilution.
+MAX_CROSSREFS_PER_PR = 3
 
 # Number of source documents per OpenRouter embedding API call.
 EMBED_BATCH_SIZE = 50
 
-# Default similarity threshold. Matches below this are not recorded.
-# At 0.65, a PR implementing a pattern without naming it typically scores
-# 0.70-0.80; unrelated content scores 0.45-0.60.
+# Default similarity threshold.
 DEFAULT_THRESHOLD = 0.65
 
 # Maximum artefact matches to record per source document.
@@ -225,10 +236,70 @@ def gh_get(path, token, params=None):
         return None
 
 
-def fetch_all_merged_prs(token, verbose=False):
+# ---------------------------------------------------------------------------
+# Cross-reference enrichment via GitHub timeline API
+# ---------------------------------------------------------------------------
+
+def fetch_pr_cross_refs(pr_num, token):
+    """
+    Fetch cross-referenced issues for a PR via the GitHub timeline API.
+
+    GitHub adds a 'cross-referenced' event to a PR's timeline whenever
+    another issue or PR mentions it. We extract only those cross-references
+    that come from real issues (not other PRs), up to MAX_CROSSREFS_PER_PR.
+
+    Returns a list of dicts: {num, title, body} for each referencing issue.
+    The body can be used to enrich the PR's embed text with the conceptual
+    discussion that motivated the PR — covering the case where the PR body
+    is implementation-only and thin on conceptual vocabulary.
+    """
+    timeline = gh_get(
+        f"/repos/{GH_OWNER}/{GH_REPO}/issues/{pr_num}/timeline",
+        token,
+        params={"per_page": 100},
+    )
+    if not timeline or not isinstance(timeline, list):
+        return []
+
+    refs = []
+    seen_nums = set()
+    for event in timeline:
+        if event.get("event") != "cross-referenced":
+            continue
+        source = event.get("source", {})
+        if source.get("type") != "issue":
+            continue
+        issue = source.get("issue", {})
+        # Skip if the cross-referencing source is itself a PR
+        if "pull_request" in issue:
+            continue
+        num = issue.get("number")
+        if not num or num in seen_nums:
+            continue
+        seen_nums.add(num)
+        title = issue.get("title", "")
+        body = (issue.get("body") or "").strip()
+        refs.append({"num": num, "title": title, "body": body})
+        if len(refs) >= MAX_CROSSREFS_PER_PR:
+            break
+
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# GitHub source fetching
+# ---------------------------------------------------------------------------
+
+def fetch_all_merged_prs(token, enrich=True, verbose=False):
     """
     Fetch all merged PRs from the OB1 repo via paginated API.
-    Returns a list of dicts with: num, title, body, created_at, author, state.
+
+    When enrich=True (default), fetches each PR's timeline to find
+    cross-referenced issues and appends their bodies to the embed text.
+    PRs enriched this way use match_basis 'embed_pr_enriched' rather than
+    'embed_pr_body', so the report can distinguish the two cases.
+
+    Returns a list of source dicts ready for embedding.
     """
     prs = []
     page = 1
@@ -242,7 +313,6 @@ def fetch_all_merged_prs(token, verbose=False):
             break
 
         for pr in batch:
-            # closed PRs include both merged and unmerged; filter to merged only
             if not pr.get("merged_at"):
                 continue
             num = pr["number"]
@@ -251,19 +321,45 @@ def fetch_all_merged_prs(token, verbose=False):
             combined = f"{title}\n{body}"
             if len(combined) < MIN_BODY_CHARS:
                 continue
+
+            embed_text = f"{title}\n{body[:MAX_BODY_CHARS]}"
+            github_refs = [f"PR#{num}"]
+            match_basis = "embed_pr_body"
+
+            # Fetch cross-referenced issues and enrich embed text
+            if enrich:
+                cross_refs = fetch_pr_cross_refs(num, token)
+                time.sleep(0.2)
+                if cross_refs:
+                    enrichment_parts = []
+                    for ref in cross_refs:
+                        ref_text = f"Referenced by issue #{ref['num']}: {ref['title']}"
+                        if ref["body"]:
+                            ref_text += f"\n{ref['body'][:MAX_CROSSREF_BODY_CHARS]}"
+                        enrichment_parts.append(ref_text)
+                        github_refs.append(f"issue#{ref['num']}")
+                    embed_text = (
+                        f"{title}\n{body[:MAX_BODY_CHARS]}\n\n"
+                        + "\n\n".join(enrichment_parts)
+                    )
+                    match_basis = "embed_pr_enriched"
+
             if verbose:
-                print(f"    PR #{num}: {title[:60]}")
+                enriched_str = f" [+{len(github_refs)-1} refs]" if len(github_refs) > 1 else ""
+                print(f"    PR #{num}{enriched_str}: {title[:60]}")
+
             prs.append({
                 "num": num,
                 "ref": f"PR#{num}",
                 "title": title,
                 "body": body,
-                "embed_text": f"{title}\n{body[:MAX_BODY_CHARS]}",
+                "embed_text": embed_text,
                 "created_at": pr.get("created_at", ""),
                 "author": pr.get("user", {}).get("login", ""),
                 "state": "merged",
                 "channel_name": f"PR#{num} (merged): {title[:70]}",
-                "match_basis": "embed_pr_body",
+                "match_basis": match_basis,
+                "github_refs": github_refs,
             })
 
         if len(batch) < 100:
@@ -277,9 +373,7 @@ def fetch_all_merged_prs(token, verbose=False):
 def fetch_all_issues(token, verbose=False):
     """
     Fetch all real issues (excluding PRs) from the OB1 repo.
-    The /issues endpoint returns both issues and PRs; we filter by the
-    absence of the pull_request key.
-    Returns a list of dicts with: num, title, body, created_at, author.
+    Returns a list of source dicts ready for embedding.
     """
     issues = []
     page = 1
@@ -293,7 +387,6 @@ def fetch_all_issues(token, verbose=False):
             break
 
         for issue in batch:
-            # Skip PRs that appear in the issues endpoint
             if "pull_request" in issue:
                 continue
             num = issue["number"]
@@ -315,6 +408,7 @@ def fetch_all_issues(token, verbose=False):
                 "state": issue.get("state", ""),
                 "channel_name": f"issue#{num}: {title[:70]}",
                 "match_basis": "embed_issue_body",
+                "github_refs": [f"issue#{num}"],
             })
 
         if len(batch) < 100:
@@ -332,7 +426,7 @@ def fetch_all_issues(token, verbose=False):
 def embed_batch(texts, api_key):
     """
     Embed a list of texts via OpenRouter. Returns a list of vectors (lists of
-    floats) in the same order as the input. Returns None values on failure.
+    floats) in the same order. Returns None values on failure.
     """
     payload = json.dumps({"model": EMBED_MODEL, "input": texts}).encode()
     req = urllib.request.Request(OPENROUTER_EMBED_URL, data=payload, method="POST")
@@ -350,8 +444,7 @@ def embed_batch(texts, api_key):
 
 def embed_all_sources(sources, api_key):
     """
-    Embed all source documents in batches of EMBED_BATCH_SIZE.
-    Attaches embedding in-place to each source dict.
+    Embed all source documents in batches. Attaches embedding in-place.
     Returns the number of successful embeddings.
     """
     total = len(sources)
@@ -365,7 +458,7 @@ def embed_all_sources(sources, api_key):
             source["embedding"] = vec
             if vec is not None:
                 success += 1
-        time.sleep(0.5)  # courtesy pause between batches
+        time.sleep(0.5)
     return success
 
 
@@ -373,42 +466,19 @@ def embed_all_sources(sources, api_key):
 # Cosine similarity
 # ---------------------------------------------------------------------------
 
-def _normalize(vec):
-    """L2-normalize a list of floats. Returns a list."""
-    if HAS_NUMPY:
-        v = np.array(vec, dtype=np.float32)
-        norm = np.linalg.norm(v)
-        return (v / norm).tolist() if norm > 0 else vec
-    else:
-        norm = sum(x * x for x in vec) ** 0.5
-        return [x / norm for x in vec] if norm > 0 else vec
-
-
-def compute_similarity(source_vec, artefact_vec_norm):
-    """
-    Dot product of a (normalised) source vector against a pre-normalised
-    artefact vector. Equivalent to cosine similarity when both are normalised.
-    """
-    if HAS_NUMPY:
-        return float(np.dot(np.array(source_vec, dtype=np.float32), artefact_vec_norm))
-    else:
-        return sum(a * b for a, b in zip(source_vec, artefact_vec_norm))
-
-
 def precompute_artefact_norms(artefacts):
-    """
-    Normalise all artefact embeddings once. Attaches embedding_norm in-place.
-    With numpy this is vectorised; without it processes one at a time.
-    """
+    """Normalise all artefact embeddings once. Attaches embedding_norm in-place."""
     if HAS_NUMPY:
         mat = np.array([a["embedding"] for a in artefacts], dtype=np.float32)
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         normed = mat / np.where(norms > 0, norms, 1.0)
         for a, row in zip(artefacts, normed):
-            a["embedding_norm"] = row  # numpy array, used directly in dot product
+            a["embedding_norm"] = row
     else:
         for a in artefacts:
-            a["embedding_norm"] = _normalize(a["embedding"])
+            vec = a["embedding"]
+            norm = sum(x * x for x in vec) ** 0.5
+            a["embedding_norm"] = [x / norm for x in vec] if norm > 0 else vec
 
 
 # ---------------------------------------------------------------------------
@@ -418,9 +488,7 @@ def precompute_artefact_norms(artefacts):
 def compute_matches(sources, artefacts, threshold, verbose=False):
     """
     For each source document with a valid embedding, compute cosine similarity
-    against all artefact embeddings. Record matches above threshold as
-    pass-5 linkage rows.
-
+    against all artefact embeddings. Record top matches above threshold.
     Returns a list of linkage row dicts.
     """
     results = []
@@ -432,7 +500,6 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
             skipped += 1
             continue
 
-        # Normalise source vector
         if HAS_NUMPY:
             svec = np.array(vec, dtype=np.float32)
             snorm = np.linalg.norm(svec)
@@ -441,29 +508,25 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
                 continue
             svec_norm = svec / snorm
         else:
-            svec_norm = _normalize(vec)
+            norm = sum(x * x for x in vec) ** 0.5
+            svec_norm = [x / norm for x in vec] if norm > 0 else vec
 
-        # Score against every artefact
         scored = []
         for a in artefacts:
             anorm = a["embedding_norm"]
-            if HAS_NUMPY:
-                sim = float(np.dot(svec_norm, anorm))
-            else:
-                sim = sum(x * y for x, y in zip(svec_norm, anorm))
+            sim = float(np.dot(svec_norm, anorm)) if HAS_NUMPY else sum(x * y for x, y in zip(svec_norm, anorm))
             if sim >= threshold:
                 scored.append((a, sim))
 
-        # Keep top N by similarity
         scored.sort(key=lambda x: -x[1])
         top = scored[:TOP_N_PER_SOURCE]
 
         if verbose and top:
-            print(f"    {source['ref']}: {len(top)} matches — top: "
+            enriched = " [enriched]" if source["match_basis"] == "embed_pr_enriched" else ""
+            print(f"    {source['ref']}{enriched}: {len(top)} matches — top: "
                   f"{top[0][0]['slug']} ({top[0][1]:.3f})")
 
         for a, sim in top:
-            score = int(sim * 100)
             results.append({
                 "pass": 5,
                 "match_basis": source["match_basis"],
@@ -473,11 +536,11 @@ def compute_matches(sources, artefacts, threshold, verbose=False):
                 "artefact_slug": a["slug"],
                 "artefact_title": a["title"],
                 "artefact_category": a["category"],
-                "score": score,
+                "score": int(sim * 100),
                 "similarity": round(sim, 4),
                 "window_start": source["created_at"],
                 "window_end": source["created_at"],
-                "github_refs": [source["ref"]],
+                "github_refs": source["github_refs"],
                 "author": source["author"],
                 "sample_text": source["body"][:400],
             })
@@ -497,7 +560,6 @@ def write_to_db(conn, results, dry_run=False):
     if dry_run:
         print(f"[dry-run] Would write {len(results)} pass-5 rows to artefact_linkages")
         return
-
     conn.execute("DELETE FROM artefact_linkages WHERE pass = 5")
     for r in results:
         conn.execute(
@@ -507,19 +569,10 @@ def write_to_db(conn, results, dry_run=False):
                 score, window_start, window_end, github_refs, sample_text)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                r["pass"],
-                r["match_basis"],
-                r["channel_id"],
-                r["channel_name"],
-                r["category"],
-                r["artefact_slug"],
-                r["artefact_title"],
-                r["artefact_category"],
-                r["score"],
-                r["window_start"],
-                r["window_end"],
-                json.dumps(r["github_refs"]),
-                r["sample_text"][:500],
+                r["pass"], r["match_basis"], r["channel_id"], r["channel_name"],
+                r["category"], r["artefact_slug"], r["artefact_title"],
+                r["artefact_category"], r["score"], r["window_start"],
+                r["window_end"], json.dumps(r["github_refs"]), r["sample_text"][:500],
             ),
         )
     conn.commit()
@@ -527,31 +580,27 @@ def write_to_db(conn, results, dry_run=False):
 
 
 # ---------------------------------------------------------------------------
-# Validation report: PR #90 schema-aware-routing
+# Validation
 # ---------------------------------------------------------------------------
 
 def print_pr90_validation(results, pass4_rows=None):
-    """
-    Print the score for schema-aware-routing on PR #90 under both methods,
-    to validate that embedding-based classification catches what term
-    matching misses.
-    """
+    """Print schema-aware-routing score on PR #90 for both methods."""
     slug = "schema-aware-routing"
     print("\n--- Validation: schema-aware-routing on PR #90 ---")
-
-    # Pass 5 (embedding)
     embed_match = next(
         (r for r in results
-         if r["artefact_slug"] == slug and "PR#90" in (r["github_refs"] or [])),
+         if r["artefact_slug"] == slug and "PR#90" in r["github_refs"]),
         None,
     )
     if embed_match:
         sim = embed_match.get("similarity", embed_match["score"] / 100)
-        print(f"  Pass 5 (embed): score={embed_match['score']}, similarity={sim:.4f}  ✓")
+        basis = embed_match["match_basis"]
+        print(f"  Pass 5 ({basis}): score={embed_match['score']}, similarity={sim:.4f}  ✓")
+        if len(embed_match["github_refs"]) > 1:
+            print(f"  Enriched with: {', '.join(embed_match['github_refs'][1:])}")
     else:
         print(f"  Pass 5 (embed): no match above threshold")
 
-    # Pass 4 (term) for comparison, if rows supplied
     if pass4_rows is not None:
         term_match = next(
             (r for r in pass4_rows
@@ -559,10 +608,8 @@ def print_pr90_validation(results, pass4_rows=None):
              and "PR#90" in str(r.get("github_refs", ""))),
             None,
         )
-        if term_match:
-            print(f"  Pass 4 (term):  score={term_match['score']}")
-        else:
-            print(f"  Pass 4 (term):  no match (score=0 or 1)")
+        print(f"  Pass 4 (term):  score={term_match['score']}" if term_match
+              else "  Pass 4 (term):  score=0 or 1")
     print()
 
 
@@ -571,42 +618,30 @@ def print_pr90_validation(results, pass4_rows=None):
 # ---------------------------------------------------------------------------
 
 def regenerate_reports(conn, out_dir, pass5_results=None):
-    """
-    Read all linkage rows from the DB and write updated report files.
-    pass5_results is the in-memory list of new rows, used to annotate
-    similarity scores in the markdown (similarity is not stored in the DB).
-    """
     cur = conn.execute(
         """SELECT pass, match_basis, channel_name, category,
                   artefact_slug, artefact_title, artefact_category,
                   score, window_start, window_end, github_refs, sample_text
-           FROM artefact_linkages
-           ORDER BY artefact_slug, score DESC"""
+           FROM artefact_linkages ORDER BY artefact_slug, score DESC"""
     )
-    rows = cur.fetchall()
     fields = ["pass", "match_basis", "channel_name", "category",
               "artefact_slug", "artefact_title", "artefact_category",
               "score", "window_start", "window_end", "github_refs", "sample_text"]
-    results = [dict(zip(fields, r)) for r in rows]
+    results = [dict(zip(fields, r)) for r in cur.fetchall()]
 
-    # Build similarity lookup from in-memory pass5 results
     sim_lookup = {}
     if pass5_results:
         for r in pass5_results:
-            key = (r["channel_name"], r["artefact_slug"])
-            sim_lookup[key] = r.get("similarity", r["score"] / 100)
+            sim_lookup[(r["channel_name"], r["artefact_slug"])] = r.get("similarity", r["score"] / 100)
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # CSV
     csv_path = os.path.join(out_dir, "linkage_report_full.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(results)
+        csv.DictWriter(f, fieldnames=fields).writeheader()
+        csv.DictWriter(f, fieldnames=fields).writerows(results)
     print(f"Written: {csv_path}")
 
-    # Markdown
     md_path = os.path.join(out_dir, "linkage_report_full.md")
     _write_markdown(results, sim_lookup, md_path)
     print(f"Written: {md_path}")
@@ -619,21 +654,10 @@ def _write_markdown(results, sim_lookup, path):
         if slug:
             by_artefact[slug].append(r)
 
-    # Separate pass buckets
-    def rows_for_pass(entries, pass_num):
-        return [e for e in entries if e["pass"] == pass_num]
-
-    def discord_score(entries):
-        return sum(e["score"] for e in entries if e["pass"] in (1, 2, 3))
-
-    def term_score(entries):
-        return sum(e["score"] for e in entries if e["pass"] == 4)
-
-    def embed_score(entries):
-        return sum(e["score"] for e in entries if e["pass"] == 5)
-
-    def total_score(entries):
-        return discord_score(entries) + term_score(entries) + embed_score(entries)
+    def discord_score(e): return sum(x["score"] for x in e if x["pass"] in (1, 2, 3))
+    def term_score(e):    return sum(x["score"] for x in e if x["pass"] == 4)
+    def embed_score(e):   return sum(x["score"] for x in e if x["pass"] == 5)
+    def total_score(e):   return discord_score(e) + term_score(e) + embed_score(e)
 
     lines = ["# OB1 Discord + GitHub → Artefact Linkage Report (Full)", ""]
     lines.append(f"Generated: {datetime.now().isoformat()}")
@@ -642,47 +666,45 @@ def _write_markdown(results, sim_lookup, path):
     lines.append("")
     lines.append("Score columns: Discord (passes 1-3, term) | GitHub term (pass 4) | GitHub embed (pass 5).")
     lines.append("Pass 5 scores are similarity × 100 — not directly comparable to term scores.")
+    lines.append("match_basis 'embed_pr_enriched' = PR body + cross-referenced issue context.")
     lines.append("")
 
-    # --- Per-artefact section, sorted by embed score then total ---
     lines.append("## Artefacts by embedding score (pass 5)")
     lines.append("")
-    slugs_by_embed = sorted(
+    slugs_sorted = sorted(
         by_artefact.keys(),
         key=lambda s: (-embed_score(by_artefact[s]), -total_score(by_artefact[s]))
     )
-    for slug in slugs_by_embed:
+    for slug in slugs_sorted:
         entries = by_artefact[slug]
-        ds = discord_score(entries)
-        ts = term_score(entries)
-        es = embed_score(entries)
         title = next((e["artefact_title"] for e in entries), slug)
         lines.append(
             f"### `{slug}` — {title} "
-            f"(Discord: {ds} | term: {ts} | embed: {es})"
+            f"(Discord: {discord_score(entries)} | term: {term_score(entries)} | embed: {embed_score(entries)})"
         )
         seen = set()
         for e in sorted(entries, key=lambda x: (-x["pass"], -x["score"])):
             ch = e["channel_name"]
-            key = (ch, slug)
             if ch in seen:
                 continue
             seen.add(ch)
-            basis = e["match_basis"]
-            score = e["score"]
             sim_str = ""
-            if e["pass"] == 5 and key in sim_lookup:
-                sim_str = f", sim={sim_lookup[key]:.3f}"
+            if e["pass"] == 5:
+                sim = sim_lookup.get((ch, slug))
+                if sim:
+                    sim_str = f", sim={sim:.3f}"
             sample = (e.get("sample_text") or "")[:100].replace("\n", " ")
-            lines.append(f"  - [pass {e['pass']}, {basis}, {score}{sim_str}] **{ch}**: {sample}…")
+            lines.append(
+                f"  - [pass {e['pass']}, {e['match_basis']}, {e['score']}{sim_str}] "
+                f"**{ch}**: {sample}…"
+            )
         lines.append("")
 
-    # --- Method comparison: top 15 by embed only ---
     lines.append("## Top 15 artefacts by embedding score alone")
     lines.append("")
     lines.append("| Slug | Embed score | Term score | Discord score |")
     lines.append("|------|-------------|------------|---------------|")
-    for slug in slugs_by_embed[:15]:
+    for slug in slugs_sorted[:15]:
         entries = by_artefact[slug]
         lines.append(
             f"| `{slug}` | {embed_score(entries)} "
@@ -690,30 +712,18 @@ def _write_markdown(results, sim_lookup, path):
         )
     lines.append("")
 
-    # --- PR #90 callout ---
     lines.append("## Validation: schema-aware-routing on PR #90")
     lines.append("")
-    sar_entries = by_artefact.get("schema-aware-routing", [])
-    pr90_embed = next(
-        (e for e in sar_entries
-         if e["pass"] == 5 and "PR#90" in str(e.get("github_refs", ""))),
-        None,
-    )
-    pr90_term = next(
-        (e for e in sar_entries
-         if e["pass"] == 4 and "PR#90" in str(e.get("github_refs", ""))),
-        None,
-    )
-    if pr90_embed:
-        key = (pr90_embed["channel_name"], "schema-aware-routing")
-        sim = sim_lookup.get(key, pr90_embed["score"] / 100)
-        lines.append(f"- Pass 5 (embed): score={pr90_embed['score']}, similarity={sim:.4f}")
+    sar = by_artefact.get("schema-aware-routing", [])
+    pr90e = next((e for e in sar if e["pass"] == 5 and "PR#90" in str(e.get("github_refs", ""))), None)
+    pr90t = next((e for e in sar if e["pass"] == 4 and "PR#90" in str(e.get("github_refs", ""))), None)
+    if pr90e:
+        sim = sim_lookup.get((pr90e["channel_name"], "schema-aware-routing"), pr90e["score"] / 100)
+        lines.append(f"- Pass 5 ({pr90e['match_basis']}): score={pr90e['score']}, similarity={sim:.4f}")
     else:
-        lines.append("- Pass 5 (embed): **no match above threshold** (expected >= 65)")
-    if pr90_term:
-        lines.append(f"- Pass 4 (term):  score={pr90_term['score']}")
-    else:
-        lines.append("- Pass 4 (term):  score=0 or 1 (term matching blind to PR body)")
+        lines.append("- Pass 5 (embed): **no match above threshold**")
+    lines.append(f"- Pass 4 (term): score={pr90t['score']}" if pr90t
+                 else "- Pass 4 (term): score=0 or 1")
     lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
@@ -728,40 +738,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="Pass 5: embedding-based artefact classification"
     )
-    parser.add_argument(
-        "--db",
-        default=os.path.expanduser("~/discord-capture/discord_archive.db"),
-        help="Path to discord_archive.db",
-    )
-    parser.add_argument(
-        "--catalogue",
-        default=os.path.expanduser("~/discord-capture/ob1_catalogue.json"),
-        help="Path to ob1_catalogue.json (from build_catalogue.py)",
-    )
-    parser.add_argument(
-        "--out-dir",
-        default=os.path.expanduser("~/discord-output"),
-        help="Directory to write report files",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=DEFAULT_THRESHOLD,
-        help=f"Cosine similarity threshold (default: {DEFAULT_THRESHOLD})",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Compute matches but skip writing to DB",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print per-source match details",
-    )
+    parser.add_argument("--db", default=os.path.expanduser("~/discord-capture/discord_archive.db"))
+    parser.add_argument("--catalogue", default=os.path.expanduser("~/discord-capture/ob1_catalogue.json"))
+    parser.add_argument("--out-dir", default=os.path.expanduser("~/discord-output"))
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                        help=f"Cosine similarity threshold (default: {DEFAULT_THRESHOLD})")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Compute matches but skip writing to DB")
+    parser.add_argument("--no-enrich", action="store_true",
+                        help="Skip timeline cross-reference fetches (faster, less accurate)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-source match details")
     args = parser.parse_args()
 
-    # --- Tokens ---
     print("Resolving GitHub token...")
     gh_token = get_github_token()
     if not gh_token:
@@ -773,7 +762,6 @@ def main():
         print("  ERROR: OpenRouter key required for embeddings. Cannot proceed.")
         return
 
-    # --- Catalogue ---
     print(f"\nLoading catalogue from {args.catalogue}...")
     artefacts = load_catalogue(args.catalogue)
     if not artefacts:
@@ -782,10 +770,14 @@ def main():
     precompute_artefact_norms(artefacts)
     print(f"  Artefact embeddings normalised.")
 
-    # --- Fetch sources ---
-    print("\nFetching merged PRs from OB1...")
-    prs = fetch_all_merged_prs(gh_token, verbose=args.verbose)
-    print(f"  {len(prs)} merged PRs fetched")
+    enrich = not args.no_enrich
+    if enrich:
+        print("\nFetching merged PRs from OB1 (with cross-reference enrichment)...")
+    else:
+        print("\nFetching merged PRs from OB1 (enrichment skipped)...")
+    prs = fetch_all_merged_prs(gh_token, enrich=enrich, verbose=args.verbose)
+    n_enriched = sum(1 for p in prs if p["match_basis"] == "embed_pr_enriched")
+    print(f"  {len(prs)} merged PRs fetched ({n_enriched} enriched with cross-ref context)")
 
     print("\nFetching issues from OB1...")
     issues = fetch_all_issues(gh_token, verbose=args.verbose)
@@ -794,36 +786,29 @@ def main():
     sources = prs + issues
     print(f"\nTotal sources: {len(sources)}")
 
-    # --- Embed sources ---
     print(f"\nEmbedding {len(sources)} source documents (batch size {EMBED_BATCH_SIZE})...")
     n_ok = embed_all_sources(sources, or_key)
     print(f"  {n_ok}/{len(sources)} embeddings successful")
 
-    # --- Compute matches ---
     print(f"\nComputing similarity (threshold={args.threshold})...")
     results = compute_matches(sources, artefacts, args.threshold, verbose=args.verbose)
     print(f"  {len(results)} matches recorded")
 
-    # --- Validation ---
     conn = sqlite3.connect(args.db)
     pass4_rows = [
-        dict(zip(["artefact_slug", "score", "github_refs"],
-                 row))
+        dict(zip(["artefact_slug", "score", "github_refs"], row))
         for row in conn.execute(
             "SELECT artefact_slug, score, github_refs FROM artefact_linkages WHERE pass=4"
         ).fetchall()
     ]
     print_pr90_validation(results, pass4_rows)
 
-    # --- Write to DB ---
     write_to_db(conn, results, dry_run=args.dry_run)
 
-    # --- Reports ---
     print("\nRegenerating reports...")
     regenerate_reports(conn, args.out_dir, pass5_results=results)
     conn.close()
 
-    # --- Console summary ---
     by_artefact = defaultdict(int)
     for r in results:
         by_artefact[r["artefact_slug"]] += r["score"]
