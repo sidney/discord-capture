@@ -247,9 +247,13 @@ def parse_readme(text):
     The description is the first paragraph that:
       - is not a heading, blockquote, code fence, list item, or table row
       - is not noise (badges, HTML, attribution)
-      - is not an italic-only subtitle (*...*  or _..._)
+      - is not an italic-only subtitle (*...* or _..._)
       - is not a rename/deprecation notice
       - has at least 40 characters after stripping markdown backticks
+
+    GitHub admonition blocks (> [!NOTE] ... continuation lines) are tracked
+    as a unit and skipped entirely — neither the marker line nor any
+    continuation lines are accepted as tagline candidates.
     """
     lines = text.splitlines()
 
@@ -259,6 +263,7 @@ def parse_readme(text):
 
     in_code_block = False
     in_details = False
+    in_admonition_block = False  # True while inside a > [!NOTE] / [!TIP] etc. block
     current_para_lines = []
     found_title = False
     found_tagline = False
@@ -272,19 +277,16 @@ def parse_readme(text):
         text_block = " ".join(l.strip() for l in para_lines if l.strip())
         if not text_block:
             return
-
         # Skip italic-only lines — these are subtitles, not prose descriptions.
         # e.g. "*The write side of the Open Brain flywheel*"
         if re.match(r'^\*[^*]+\*$', text_block) or re.match(r'^_[^_]+_$', text_block):
             return
-
         # Skip rename/deprecation notices — meta-notes about folder names,
         # compatibility changes, or continuity remarks are not descriptions.
         # e.g. "The repo keeps the historical `claudeception` folder..."
         lower = text_block.lower()
         if any(sig in lower for sig in DEPRECATION_SIGNALS):
             return
-
         # Strip inline code backticks for length check only
         plain = re.sub(r'`[^`]*`', '', text_block).strip()
         if len(plain) >= 40:
@@ -300,6 +302,7 @@ def parse_readme(text):
                 flush_para(current_para_lines)
                 current_para_lines = []
             in_code_block = not in_code_block
+            in_admonition_block = False
             continue
         if in_code_block:
             continue
@@ -317,8 +320,9 @@ def parse_readme(text):
         if in_details:
             continue
 
-        # Blank line — flush current paragraph
+        # Blank line — flush current paragraph; ends any admonition block
         if not stripped:
+            in_admonition_block = False
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
@@ -335,6 +339,7 @@ def parse_readme(text):
         if stripped.startswith("# ") and not found_title:
             title = stripped[2:].strip()
             found_title = True
+            in_admonition_block = False
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
@@ -342,23 +347,35 @@ def parse_readme(text):
 
         # Any other heading — flush and skip
         if re.match(r'^#{2,}\s', stripped):
+            in_admonition_block = False
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
             continue
 
-        # Blockquote — tagline candidate (first non-admonition blockquote only)
+        # Blockquote lines
         if stripped.startswith("> "):
             content = stripped[2:].strip()
-            # Strip leading/trailing bold/italic markers
-            content = re.sub(r'^[*_]+|[*_]+$', '', content).strip()
-            if not found_tagline and not _is_admonition(content):
-                tagline = content
+            content_clean = re.sub(r'^[*_]+|[*_]+$', '', content).strip()
+
+            if _is_admonition(content_clean):
+                # Admonition marker line — start skipping the whole block
+                in_admonition_block = True
+            elif in_admonition_block:
+                # Continuation line of an admonition block — skip
+                pass
+            elif not found_tagline:
+                # Genuine tagline blockquote
+                tagline = content_clean
                 found_tagline = True
+
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
             continue
+
+        # Any non-blockquote line ends an admonition block
+        in_admonition_block = False
 
         # List items and table rows — flush and skip
         if re.match(r'^[-*+]\s|^\d+\.\s|^\|', stripped):
