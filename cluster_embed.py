@@ -736,9 +736,22 @@ def print_validation(results, source_stats=None, pass4_rows=None):
     issue #35 — body is about extension design; VOCABULARY_CONFIG comment is
                  the actual schema-aware-routing conceptual home
 
-    When a source has no accepted match, this still reports its best pass-5
-    similarity from source_stats so the validation block remains informative
-    rather than just saying "no match above threshold".
+    When a target source has no SAR-specific match above threshold, the
+    output distinguishes two situations rather than collapsing them into
+    one "no match above threshold" message:
+
+      (a) Source has no SAR match but DOES have other accepted matches —
+          report the global best similarity (which may or may not be
+          against SAR) and the best accepted non-SAR match. This makes
+          clear that the source is not invisible; it just didn't land on
+          its expected SAR target.
+
+      (b) Source has no accepted matches anywhere — report the global
+          best similarity as a single diagnostic.
+
+    These cases were previously conflated as "no match above threshold",
+    which conflicted with `matched_above_threshold: true` in
+    source_stats.json when (a) applied.
     """
     slug = "schema-aware-routing"
     print("\n--- Validation: schema-aware-routing ---")
@@ -750,40 +763,74 @@ def print_validation(results, source_stats=None, pass4_rows=None):
                 stats_by_ref.setdefault(ref, []).append(s)
 
     def report_target(ref, label):
-        # Accepted match against schema-aware-routing, if any.
-        accepted = next(
+        # Case 0: accepted match against schema-aware-routing.
+        accepted_sar = next(
             (r for r in results
              if r["artefact_slug"] == slug and ref in r["github_refs"]),
             None,
         )
-        if accepted:
-            sim = accepted.get("similarity", accepted["score"] / 100)
+        if accepted_sar:
+            sim = accepted_sar.get("similarity", accepted_sar["score"] / 100)
             print(
-                f"  {label} pass 5 ({accepted['match_basis']}): "
-                f"score={accepted['score']}, sim={sim:.4f}  ✓"
+                f"  {label} pass 5 ({accepted_sar['match_basis']}): "
+                f"score={accepted_sar['score']}, sim={sim:.4f}  ✓"
             )
-            if len(accepted["github_refs"]) > 1:
+            if len(accepted_sar["github_refs"]) > 1:
                 print(f"          enriched with: "
-                      f"{', '.join(accepted['github_refs'][1:])}")
+                      f"{', '.join(accepted_sar['github_refs'][1:])}")
             return
-        # No accepted match — fall back to best pass-5 similarity over all
-        # artefacts (not just schema-aware-routing).
+
+        # No SAR match. Gather global best (from source_stats) and best
+        # accepted non-SAR match (from results).
         candidates = stats_by_ref.get(ref, [])
         if not candidates:
             print(f"  {label} pass 5: no source found")
             return
-        best = max(
+        best_source = max(
             candidates,
             key=lambda s: s["best_pass5_sim"] or -1.0,
         )
-        sim = best["best_pass5_sim"]
-        if sim is None:
+        global_sim = best_source["best_pass5_sim"]
+        if global_sim is None:
             print(f"  {label} pass 5: no embedding available")
             return
+
+        ref_accepted = [
+            r for r in results
+            if r["pass"] == 5 and ref in r["github_refs"]
+        ]
+        # All ref_accepted are non-SAR by construction at this point
+        # (because accepted_sar is None).
+        best_accepted = max(ref_accepted, key=lambda e: e["score"]) if ref_accepted else None
+
+        if not best_accepted:
+            # Case (b): nothing accepted anywhere.
+            print(
+                f"  {label} pass 5: no match above any threshold — "
+                f"best sim={global_sim:.4f} against {best_source['best_pass5_artefact']} "
+                f"(cat={best_source['best_pass5_artefact_category']}, "
+                f"basis={best_source['match_basis']})"
+            )
+            return
+
+        # Case (a): source has accepted matches, but none against SAR.
+        accepted_sim = best_accepted.get("similarity", best_accepted["score"] / 100)
+        print(f"  {label} pass 5: no SAR match above threshold")
+        # Only print "global best" separately when it differs from the
+        # best accepted match (otherwise we'd repeat ourselves).
+        if (best_source["best_pass5_artefact"] != best_accepted["artefact_slug"]
+                or abs(global_sim - accepted_sim) > 0.001):
+            print(
+                f"          global best: sim={global_sim:.4f} against "
+                f"{best_source['best_pass5_artefact']} "
+                f"(cat={best_source['best_pass5_artefact_category']}, "
+                f"basis={best_source['match_basis']}) [below its threshold]"
+            )
         print(
-            f"  {label} pass 5: no match above threshold — "
-            f"best sim={sim:.4f} against {best['best_pass5_artefact']} "
-            f"(cat={best['best_pass5_artefact_category']}, basis={best['match_basis']})"
+            f"          best accepted: sim={accepted_sim:.4f} against "
+            f"{best_accepted['artefact_slug']} "
+            f"(cat={best_accepted['artefact_category']}, "
+            f"basis={best_accepted['match_basis']})  ✓"
         )
 
     report_target("PR#90", "PR #90 ")
@@ -1027,33 +1074,84 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
             for ref in s["github_refs"]:
                 stats_by_ref[ref].append(s)
 
-    def _validation_line(label, ref, accepted_entry):
-        """Generate a markdown bullet showing accepted-or-best-pass-5 for a target."""
-        if accepted_entry:
+    def _validation_lines(label, ref, accepted_sar):
+        """Generate markdown bullets for one validation target.
+
+        Returns a list of bullet strings. Three cases:
+
+        Case 0: Accepted match against schema-aware-routing exists →
+                report it as a single bullet.
+        Case (a): No SAR match but source has accepted matches against
+                other artefacts → report "no SAR match" plus best accepted
+                non-SAR match. If global best differs from best accepted
+                (i.e. a higher-sim artefact was rejected by its category
+                threshold, like SAR rejecting PR#90 at 0.5803), also
+                report the global best as a separate diagnostic bullet.
+        Case (b): No accepted matches anywhere → single bullet with
+                global best similarity.
+        """
+        if accepted_sar:
             sim = sim_lookup.get(
-                (accepted_entry["channel_name"], "schema-aware-routing"),
-                accepted_entry["score"] / 100,
+                (accepted_sar["channel_name"], "schema-aware-routing"),
+                accepted_sar["score"] / 100,
             )
-            return (
-                f"- {label} pass 5 ({accepted_entry['match_basis']}): "
-                f"score={accepted_entry['score']}, sim={sim:.4f}"
-            )
-        # No accepted match — fall back to best pass-5 over any artefact.
+            return [
+                f"- {label} pass 5 ({accepted_sar['match_basis']}): "
+                f"score={accepted_sar['score']}, sim={sim:.4f}"
+            ]
+
         candidates = stats_by_ref.get(ref, [])
         if not candidates:
-            return f"- {label} pass 5: **no source found**"
-        best = max(candidates, key=lambda s: s["best_pass5_sim"] or -1.0)
-        sim = best["best_pass5_sim"]
-        if sim is None:
-            return f"- {label} pass 5: **no embedding available**"
-        return (
-            f"- {label} pass 5: **no match above threshold** — "
-            f"best sim={sim:.4f} against `{best['best_pass5_artefact']}` "
-            f"(cat={best['best_pass5_artefact_category']}, basis={best['match_basis']})"
-        )
+            return [f"- {label} pass 5: **no source found**"]
+        best_source = max(candidates, key=lambda s: s["best_pass5_sim"] or -1.0)
+        global_sim = best_source["best_pass5_sim"]
+        if global_sim is None:
+            return [f"- {label} pass 5: **no embedding available**"]
 
-    lines.append(_validation_line("PR #90", "PR#90", pr90e))
-    lines.append(_validation_line("issue #35", "issue#35", i35e))
+        ref_accepted = [
+            r for r in results
+            if r["pass"] == 5 and ref in str(r.get("github_refs", ""))
+        ]
+        best_accepted = max(ref_accepted, key=lambda e: e["score"]) if ref_accepted else None
+
+        if not best_accepted:
+            # Case (b): nothing accepted anywhere.
+            return [
+                f"- {label} pass 5: **no match above any threshold** — "
+                f"best sim={global_sim:.4f} against `{best_source['best_pass5_artefact']}` "
+                f"(cat={best_source['best_pass5_artefact_category']}, "
+                f"basis={best_source['match_basis']})"
+            ]
+
+        # Case (a): source has accepted matches, just not against SAR.
+        accepted_sim = best_accepted.get(
+            "similarity",
+            sim_lookup.get(
+                (best_accepted["channel_name"], best_accepted["artefact_slug"]),
+                best_accepted["score"] / 100,
+            ),
+        )
+        out = [f"- {label} pass 5: **no SAR match above threshold**"]
+        # Only show "global best" as a separate bullet when it differs
+        # from the best accepted match.
+        if (best_source["best_pass5_artefact"] != best_accepted["artefact_slug"]
+                or abs(global_sim - accepted_sim) > 0.001):
+            out.append(
+                f"  - global best: sim={global_sim:.4f} against "
+                f"`{best_source['best_pass5_artefact']}` "
+                f"(cat={best_source['best_pass5_artefact_category']}, "
+                f"basis={best_source['match_basis']}) [below its threshold]"
+            )
+        out.append(
+            f"  - best accepted: sim={accepted_sim:.4f} against "
+            f"`{best_accepted['artefact_slug']}` "
+            f"(cat={best_accepted['artefact_category']}, "
+            f"basis={best_accepted['match_basis']})"
+        )
+        return out
+
+    lines.extend(_validation_lines("PR #90", "PR#90", pr90e))
+    lines.extend(_validation_lines("issue #35", "issue#35", i35e))
     lines.append(f"- PR #90  pass 4 (term): score={pr90t['score']}" if pr90t
                  else "- PR #90  pass 4 (term): score=0 or 1")
     lines.append("")
