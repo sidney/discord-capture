@@ -34,7 +34,9 @@ GitHub links — artefacts:
   If --catalogue points to a valid ob1_catalogue.json, each artefact card
   slug becomes a clickable link to the artefact in the OB1 repo:
     - Directory artefacts (recipes, integrations, etc.): tree/main/{dir}/{slug}
-    - Architecture doc chunks (docs/): blob/main/{file}#L{start}-L{end}
+    - Architecture doc chunks (docs/): blob/main/{file}?plain=1#L{start}-L{end}
+      (?plain=1 forces GitHub to show the source view where line highlights work;
+      without it, GitHub renders markdown as HTML and ignores the #L anchors)
   Without the catalogue, slugs render as plain text.
 """
 
@@ -826,11 +828,14 @@ function sourceHTML(s) {
 // ---------- artefact GitHub URL ----------
 // Returns a URL to the artefact in the OB1 repo, or null if no link data.
 // Directory artefacts (recipes, integrations, etc.) get a tree/main/ link.
-// Architecture doc chunks get a blob/main/ link with #L{start}-L{end} anchor.
+// Architecture doc chunks get a blob/main/?plain=1#L{start}-L{end} link.
+// ?plain=1 is required for .md files: without it GitHub shows the rendered
+// HTML view where #L anchors have no effect; plain=1 forces the source view
+// where the line highlight works correctly.
 function artefactGhUrl(a) {
   if (!REPORT.gh_owner || !REPORT.gh_repo || !a.gh_path) return null;
   if (a.line_start && a.line_end) {
-    return `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/blob/main/${a.gh_path}#L${a.line_start}-L${a.line_end}`;
+    return `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/blob/main/${a.gh_path}?plain=1#L${a.line_start}-L${a.line_end}`;
   }
   return `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/tree/main/${a.gh_path}`;
 }
