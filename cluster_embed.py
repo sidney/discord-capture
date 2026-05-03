@@ -773,7 +773,7 @@ def print_validation(results, source_stats=None, pass4_rows=None):
             sim = accepted_sar.get("similarity", accepted_sar["score"] / 100)
             print(
                 f"  {label} pass 5 ({accepted_sar['match_basis']}): "
-                f"score={accepted_sar['score']}, sim={sim:.4f}  ✓"
+                f"score={accepted_sar['score']}, sim={sim:.4f}  \u2713"
             )
             if len(accepted_sar["github_refs"]) > 1:
                 print(f"          enriched with: "
@@ -830,7 +830,7 @@ def print_validation(results, source_stats=None, pass4_rows=None):
             f"          best accepted: sim={accepted_sim:.4f} against "
             f"{best_accepted['artefact_slug']} "
             f"(cat={best_accepted['artefact_category']}, "
-            f"basis={best_accepted['match_basis']})  ✓"
+            f"basis={best_accepted['match_basis']})  \u2713"
         )
 
     report_target("PR#90", "PR #90 ")
@@ -855,12 +855,12 @@ def print_validation(results, source_stats=None, pass4_rows=None):
 
 def regenerate_reports(conn, out_dir, pass5_results=None, source_stats=None):
     cur = conn.execute(
-        """SELECT pass, match_basis, channel_name, category,
+        """SELECT pass, match_basis, channel_id, channel_name, category,
                   artefact_slug, artefact_title, artefact_category,
                   score, window_start, window_end, github_refs, sample_text
            FROM artefact_linkages ORDER BY artefact_slug, score DESC"""
     )
-    fields = ["pass", "match_basis", "channel_name", "category",
+    fields = ["pass", "match_basis", "channel_id", "channel_name", "category",
               "artefact_slug", "artefact_title", "artefact_category",
               "score", "window_start", "window_end", "github_refs", "sample_text"]
     results = [dict(zip(fields, r)) for r in cur.fetchall()]
@@ -941,7 +941,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
     def embed_score(e):   return sum(x["score"] for x in e if x["pass"] == 5)
     def total_score(e):   return discord_score(e) + term_score(e) + embed_score(e)
 
-    lines = ["# OB1 Discord + GitHub → Artefact Linkage Report (Full)", ""]
+    lines = ["# OB1 Discord + GitHub \u2192 Artefact Linkage Report (Full)", ""]
     lines.append(f"Generated: {datetime.now().isoformat()}")
     lines.append(f"Total linkage rows: {len(results)}")
     lines.append(f"Artefacts matched: {len(by_artefact)}")
@@ -952,8 +952,8 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
         lines.append(f"Orphan sources (no pass-5 match above threshold): {n_orphans}")
     lines.append("")
     lines.append("Score columns: Discord (passes 1-3, term) | GitHub term (pass 4) | GitHub embed (pass 5).")
-    lines.append("Pass 5 scores are similarity × 100 — not directly comparable to term scores.")
-    lines.append("Pass-5 acceptance threshold may vary by artefact category — see CATEGORY_THRESHOLDS.")
+    lines.append("Pass 5 scores are similarity \u00d7 100 \u2014 not directly comparable to term scores.")
+    lines.append("Pass-5 acceptance threshold may vary by artefact category \u2014 see CATEGORY_THRESHOLDS.")
     lines.append("match_basis: embed_pr_body | embed_pr_enriched | embed_pr_comment | embed_issue_body | embed_issue_comment")
     lines.append("")
 
@@ -967,7 +967,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
         entries = by_artefact[slug]
         title = next((e["artefact_title"] for e in entries), slug)
         lines.append(
-            f"### `{slug}` — {title} "
+            f"### `{slug}` \u2014 {title} "
             f"(Discord: {discord_score(entries)} | term: {term_score(entries)} | embed: {embed_score(entries)})"
         )
         seen = set()
@@ -984,7 +984,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
             sample = (e.get("sample_text") or "")[:100].replace("\n", " ")
             lines.append(
                 f"  - [pass {e['pass']}, {e['match_basis']}, {e['score']}{sim_str}] "
-                f"**{ch}**: {sample}…"
+                f"**{ch}**: {sample}\u2026"
             )
         lines.append("")
 
@@ -1011,7 +1011,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
         lines.append("")
         lines.append(
             "Sources with no pass-5 match above their per-category threshold. "
-            "Sorted by best pass-5 similarity ascending — most embedding-orphan first."
+            "Sorted by best pass-5 similarity ascending \u2014 most embedding-orphan first."
         )
         lines.append("")
         lines.append(
@@ -1023,7 +1023,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
         lines.append("")
 
         orphans = [s for s in source_stats if not s["matched_above_threshold"]]
-        # Sort: missing best_sim last (None → -inf for ascending sort needs
+        # Sort: missing best_sim last (None \u2192 -inf for ascending sort needs
         # special handling), then by best_sim ascending.
         orphans.sort(
             key=lambda s: (
@@ -1034,7 +1034,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
 
         n_total = len(orphans)
         if n_total == 0:
-            lines.append("_No orphan sources — every source matched something above threshold._")
+            lines.append("_No orphan sources \u2014 every source matched something above threshold._")
         else:
             lines.append(
                 f"Showing {min(ORPHAN_REPORT_CAP, n_total)} of {n_total} orphan sources. "
@@ -1049,9 +1049,9 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
             )
             for s in orphans[:ORPHAN_REPORT_CAP]:
                 sim = s["best_pass5_sim"]
-                sim_str = f"{sim:.3f}" if sim is not None else "—"
-                art = s["best_pass5_artefact"] or "—"
-                cat = s["best_pass5_artefact_category"] or "—"
+                sim_str = f"{sim:.3f}" if sim is not None else "\u2014"
+                art = s["best_pass5_artefact"] or "\u2014"
+                cat = s["best_pass5_artefact_category"] or "\u2014"
                 p4 = s.get("pass4_total_score", 0)
                 ch = s["channel_name"]
                 lines.append(
@@ -1117,7 +1117,7 @@ def _write_markdown(results, sim_lookup, path, source_stats=None):
         if not best_accepted:
             # Case (b): nothing accepted anywhere.
             return [
-                f"- {label} pass 5: **no match above any threshold** — "
+                f"- {label} pass 5: **no match above any threshold** \u2014 "
                 f"best sim={global_sim:.4f} against `{best_source['best_pass5_artefact']}` "
                 f"(cat={best_source['best_pass5_artefact_category']}, "
                 f"basis={best_source['match_basis']})"
@@ -1194,7 +1194,7 @@ def main():
     print("Resolving GitHub token...")
     gh_token = get_github_token()
     if not gh_token:
-        print("  No token — unauthenticated API (60 req/hr).")
+        print("  No token \u2014 unauthenticated API (60 req/hr).")
 
     print("Resolving OpenRouter key...")
     or_key = get_openrouter_key()
