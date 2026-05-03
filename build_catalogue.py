@@ -27,6 +27,15 @@ The catalogue JSON is the source of truth for the embedding-based classifier
 (cluster_embed.py). It replaces the hand-maintained ARTEFACTS dict in
 cluster_discord.py and cluster_github.py.
 
+Each entry now also stores:
+  gh_path    — repo-relative path to the artefact directory (non-architecture)
+               or source doc file (architecture), used by generate_html.py to
+               build GitHub deep links.
+  line_start — 1-indexed first line of this entry in gh_path (architecture
+               entries only; None for directory artefacts).
+  line_end   — 1-indexed last line of this entry in gh_path (architecture
+               entries only; None for directory artefacts).
+
 Usage:
   python3 build_catalogue.py [--out PATH] [--no-embed] [--verbose]
 
@@ -287,17 +296,6 @@ def parse_readme(text):
       tagline     — text of the first blockquote (> ...) near the top, or ""
       description — first substantive prose paragraph (40+ chars)
       embed_text  — tagline + ". " + description (used for the embedding)
-
-    The description is the first paragraph that:
-      - is not a heading, blockquote, code fence, list item, or table row
-      - is not noise (badges, HTML, attribution)
-      - is not an italic-only subtitle (*...* or _..._)
-      - is not a rename/deprecation notice
-      - has at least 40 characters after stripping markdown backticks
-
-    GitHub admonition blocks (> [!NOTE] ... continuation lines) are tracked
-    as a unit and skipped entirely — neither the marker line nor any
-    continuation lines are accepted as tagline candidates.
     """
     lines = text.splitlines()
 
@@ -307,31 +305,24 @@ def parse_readme(text):
 
     in_code_block = False
     in_details = False
-    in_admonition_block = False  # True while inside a > [!NOTE] / [!TIP] etc. block
+    in_admonition_block = False
     current_para_lines = []
     found_title = False
     found_tagline = False
     found_description = False
 
     def flush_para(para_lines):
-        """Try to accept a paragraph buffer as the description."""
         nonlocal description, found_description
         if found_description:
             return
         text_block = " ".join(l.strip() for l in para_lines if l.strip())
         if not text_block:
             return
-        # Skip italic-only lines — these are subtitles, not prose descriptions.
-        # e.g. "*The write side of the Open Brain flywheel*"
         if re.match(r'^\*[^*]+\*$', text_block) or re.match(r'^_[^_]+_$', text_block):
             return
-        # Skip rename/deprecation notices — meta-notes about folder names,
-        # compatibility changes, or continuity remarks are not descriptions.
-        # e.g. "The repo keeps the historical `claudeception` folder..."
         lower = text_block.lower()
         if any(sig in lower for sig in DEPRECATION_SIGNALS):
             return
-        # Strip inline code backticks for length check only
         plain = re.sub(r'`[^`]*`', '', text_block).strip()
         if len(plain) >= 40:
             description = text_block
@@ -340,7 +331,6 @@ def parse_readme(text):
     for line in lines:
         stripped = line.strip()
 
-        # Track fenced code blocks — skip their contents entirely
         if stripped.startswith("```") or stripped.startswith("~~~"):
             if current_para_lines:
                 flush_para(current_para_lines)
@@ -351,7 +341,6 @@ def parse_readme(text):
         if in_code_block:
             continue
 
-        # Track <details> blocks — skip SQL expansions and similar
         if stripped.startswith("<details"):
             if current_para_lines:
                 flush_para(current_para_lines)
@@ -364,7 +353,6 @@ def parse_readme(text):
         if in_details:
             continue
 
-        # Blank line — flush current paragraph; ends any admonition block
         if not stripped:
             in_admonition_block = False
             if current_para_lines:
@@ -372,14 +360,12 @@ def parse_readme(text):
                 current_para_lines = []
             continue
 
-        # Noise lines contribute nothing
         if _is_noise_line(line):
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
             continue
 
-        # H1 heading — title
         if stripped.startswith("# ") and not found_title:
             title = stripped[2:].strip()
             found_title = True
@@ -389,7 +375,6 @@ def parse_readme(text):
                 current_para_lines = []
             continue
 
-        # Any other heading — flush and skip
         if re.match(r'^#{2,}\s', stripped):
             in_admonition_block = False
             if current_para_lines:
@@ -397,19 +382,15 @@ def parse_readme(text):
                 current_para_lines = []
             continue
 
-        # Blockquote lines
         if stripped.startswith("> "):
             content = stripped[2:].strip()
             content_clean = re.sub(r'^[*_]+|[*_]+$', '', content).strip()
 
             if _is_admonition(content_clean):
-                # Admonition marker line — start skipping the whole block
                 in_admonition_block = True
             elif in_admonition_block:
-                # Continuation line of an admonition block — skip
                 pass
             elif not found_tagline:
-                # Genuine tagline blockquote
                 tagline = content_clean
                 found_tagline = True
 
@@ -418,32 +399,25 @@ def parse_readme(text):
                 current_para_lines = []
             continue
 
-        # Any non-blockquote line ends an admonition block
         in_admonition_block = False
 
-        # List items and table rows — flush and skip
         if re.match(r'^[-*+]\s|^\d+\.\s|^\|', stripped):
             if current_para_lines:
                 flush_para(current_para_lines)
                 current_para_lines = []
             continue
 
-        # GitHub admonition markers inside body text — skip
         if _is_admonition(stripped):
             continue
 
-        # If we already have a description, stop accumulating
         if found_description:
             break
 
-        # Ordinary prose line — add to current paragraph
         current_para_lines.append(stripped)
 
-    # Flush anything remaining
     if current_para_lines and not found_description:
         flush_para(current_para_lines)
 
-    # Build embed_text: tagline + description
     parts = [p for p in [tagline, description] if p]
     embed_text = ". ".join(parts) if parts else title
 
@@ -460,12 +434,7 @@ def parse_readme(text):
 # ---------------------------------------------------------------------------
 
 def slugify(text):
-    """Convert a heading text into a stable slug-friendly identifier.
-
-    Strips surrounding quotes/asterisks/underscores, lowercases, replaces
-    runs of non-alphanumerics with single hyphens, and trims leading and
-    trailing hyphens. Stable across reruns.
-    """
+    """Convert a heading text into a stable slug-friendly identifier."""
     text = text.strip().strip('"\'*_')
     text = re.sub(r'[^a-z0-9]+', '-', text.lower())
     text = re.sub(r'-+', '-', text).strip('-')
@@ -479,12 +448,7 @@ def _normalize_for_match(s):
 
 def extract_doc_lead(text, stop_heading_pattern):
     """Return the portion of text up to (but not including) the first line
-    matching stop_heading_pattern (a regex pattern matched against the
-    stripped line).
-
-    Used to extract the conceptual core of a long doc by truncating before
-    the implementation-detail section.
-    """
+    matching stop_heading_pattern."""
     lines = text.splitlines()
     out = []
     for line in lines:
@@ -505,20 +469,26 @@ def parse_faq_sections(text, target_h2_titles):
       - If the H2 has no H3 children, the entire H2 section becomes one chunk
         (h3_title=None, is_lead=False).
 
-    Trailing horizontal rules (---) are stripped from each chunk's content.
-    Heading matching ignores case, punctuation, and surrounding quotes.
-
     Returns a list of dicts with keys:
-      h2_title  — the H2 heading text as it appears in source
-      h3_title  — the H3 heading text, or None for H2-lead/whole-section chunks
-      content   — chunk body (no leading/trailing whitespace, no trailing rules)
-      is_lead   — True if this is the H2 lead-text chunk
+      h2_title   — the H2 heading text as it appears in source
+      h3_title   — the H3 heading text, or None for H2-lead/whole-section chunks
+      content    — chunk body (no leading/trailing whitespace, no trailing rules)
+      is_lead    — True if this is the H2 lead-text chunk
+      line_start — 1-indexed first line of this chunk in the source file
+                   (includes the H2 or H3 heading line)
+      line_end   — 1-indexed last line of this chunk in the source file
+
+    Line numbers are absolute positions in the full text passed to this
+    function, so callers should pass the complete file content unchanged.
     """
     lines = text.splitlines()
 
-    # Pass 1: find H2 boundaries. Each H2 spans from its heading line to the
-    # next H2 (or EOF). H1, H3, and deeper headings do not affect boundaries.
-    sections = []  # list of (h2_title, content_start_line, end_line)
+    # Pass 1: find H2 boundaries.
+    # sections: list of (h2_title, content_start, end) where
+    #   content_start = 0-indexed index of first line AFTER the H2 heading
+    #   end           = 0-indexed index of next H2 heading (exclusive), or len(lines)
+    # The H2 heading itself is at index (content_start - 1).
+    sections = []
     current_h2 = None
     current_start = None
 
@@ -526,8 +496,6 @@ def parse_faq_sections(text, target_h2_titles):
 
     for i, line in enumerate(lines):
         stripped = line.strip()
-        # H2 = exactly two leading hashes followed by space.
-        # `### ...` (H3) starts with three hashes so won't match `## `.
         m = h2_re.match(stripped)
         if m and not stripped.startswith("###"):
             if current_h2 is not None:
@@ -537,7 +505,7 @@ def parse_faq_sections(text, target_h2_titles):
     if current_h2 is not None:
         sections.append((current_h2, current_start, len(lines)))
 
-    # Filter to target H2s using normalized matching.
+    # Filter to target H2s.
     target_normalized = {_normalize_for_match(t) for t in target_h2_titles}
     selected = [
         (h2, start, end) for (h2, start, end) in sections
@@ -545,13 +513,20 @@ def parse_faq_sections(text, target_h2_titles):
     ]
 
     # Pass 2: within each selected section, find H3 boundaries and emit chunks.
+    #
+    # Line number conventions (all 1-indexed for GitHub compatibility):
+    #   H2 heading:             content_start      (= 0-indexed content_start - 1, + 1)
+    #   H3 heading at h3_idx:   content_start + h3_idx + 1
+    #   Last line of chunk at   content_start + chunk_end  (chunk_end is exclusive
+    #   chunk_end (relative):   relative index, so last included line is chunk_end-1)
     results = []
     h3_re = re.compile(r'^###\s+(.+?)\s*$')
 
     for h2_title, start, end in selected:
+        # start = first content line after H2 heading (0-indexed)
+        # H2 heading is at 0-indexed (start-1), 1-indexed = start
         section_lines = lines[start:end]
 
-        # Locate all H3 starts within this section (relative line indices).
         h3_positions = []
         for j, line in enumerate(section_lines):
             stripped = line.strip()
@@ -560,29 +535,33 @@ def parse_faq_sections(text, target_h2_titles):
                 h3_positions.append((j, m.group(1).strip()))
 
         if not h3_positions:
-            # No H3 children — emit the whole H2 section as one chunk.
+            # No H3 children — whole H2 section as one chunk.
             content = "\n".join(section_lines).strip()
             content = re.sub(r'\n+\s*-{3,}\s*$', '', content).strip()
             if content:
                 results.append({
-                    "h2_title": h2_title,
-                    "h3_title": None,
-                    "content": content,
-                    "is_lead": False,
+                    "h2_title":   h2_title,
+                    "h3_title":   None,
+                    "content":    content,
+                    "is_lead":    False,
+                    "line_start": start,      # 1-indexed H2 heading
+                    "line_end":   end,        # 1-indexed last content line
                 })
             continue
 
-        # H2 lead — content from H2 heading line to first H3.
+        # H2 lead — content from H2 heading to first H3.
         first_h3_idx = h3_positions[0][0]
         lead_lines = section_lines[:first_h3_idx]
         lead_content = "\n".join(lead_lines).strip()
         lead_content = re.sub(r'\n+\s*-{3,}\s*$', '', lead_content).strip()
         if len(lead_content) >= H2_LEAD_MIN_CHARS:
             results.append({
-                "h2_title": h2_title,
-                "h3_title": None,
-                "content": lead_content,
-                "is_lead": True,
+                "h2_title":   h2_title,
+                "h3_title":   None,
+                "content":    lead_content,
+                "is_lead":    True,
+                "line_start": start,                     # 1-indexed H2 heading
+                "line_end":   start + first_h3_idx,      # 1-indexed last lead line
             })
 
         # Each H3 child as its own chunk.
@@ -598,10 +577,12 @@ def parse_faq_sections(text, target_h2_titles):
             content = re.sub(r'\n+\s*-{3,}\s*$', '', content).strip()
             if content:
                 results.append({
-                    "h2_title": h2_title,
-                    "h3_title": h3_title,
-                    "content": content,
-                    "is_lead": False,
+                    "h2_title":   h2_title,
+                    "h3_title":   h3_title,
+                    "content":    content,
+                    "is_lead":    False,
+                    "line_start": start + h3_idx + 1,   # 1-indexed H3 heading
+                    "line_end":   start + chunk_end,     # 1-indexed last content line
                 })
 
     return results
@@ -612,11 +593,7 @@ def parse_faq_sections(text, target_h2_titles):
 # ---------------------------------------------------------------------------
 
 def embed_texts(texts, api_key):
-    """
-    Call OpenRouter's embeddings endpoint with a list of texts.
-    Returns a list of embedding vectors in the same order as texts.
-    Returns a list of None values if the call fails.
-    """
+    """Call OpenRouter's embeddings endpoint. Returns list of vectors (or Nones)."""
     payload = json.dumps({
         "model": EMBED_MODEL,
         "input": texts,
@@ -633,7 +610,6 @@ def embed_texts(texts, api_key):
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode())
-        # data["data"] is a list of {"index": N, "embedding": [...], "object": "embedding"}
         ordered = sorted(data["data"], key=lambda x: x["index"])
         return [item["embedding"] for item in ordered]
     except Exception as ex:
@@ -646,9 +622,13 @@ def embed_texts(texts, api_key):
 # ---------------------------------------------------------------------------
 
 def crawl_artefacts(gh_token, verbose=False):
-    """
-    Walk each ARTEFACT_DIR, list subdirectories, fetch README.md for each,
-    and return a list of artefact dicts (without embeddings yet).
+    """Walk each ARTEFACT_DIR, fetch README.md for each subdirectory, and
+    return a list of artefact dicts (without embeddings yet).
+
+    Each entry includes:
+      gh_path    — repo-relative directory path, e.g. "recipes/schema-aware-routing"
+      line_start — None (directory artefacts link to the whole directory)
+      line_end   — None
     """
     artefacts = []
 
@@ -678,7 +658,7 @@ def crawl_artefacts(gh_token, verbose=False):
                 print(f"    {slug}")
 
             readme_text = fetch_readme(readme_path, gh_token)
-            time.sleep(0.25)  # stay well under 5000 req/hr
+            time.sleep(0.25)
 
             if not readme_text:
                 print(f"  [warn] No README.md found for {slug}")
@@ -691,15 +671,18 @@ def crawl_artefacts(gh_token, verbose=False):
                     parsed["embed_text"] = slug
 
             artefacts.append({
-                "slug": slug,
-                "category": category,
-                "title": parsed["title"],
-                "tagline": parsed["tagline"],
+                "slug":        slug,
+                "category":    category,
+                "title":       parsed["title"],
+                "tagline":     parsed["tagline"],
                 "description": parsed["description"],
-                "embed_text": parsed["embed_text"],
-                "embedding": None,  # filled in by embed pass
+                "embed_text":  parsed["embed_text"],
+                "embedding":   None,
                 "readme_path": readme_path,
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "gh_path":     f"{dir_name}/{slug}",  # tree/main/ link target
+                "line_start":  None,
+                "line_end":    None,
+                "fetched_at":  datetime.now(timezone.utc).isoformat(),
             })
 
     return artefacts
@@ -708,19 +691,8 @@ def crawl_artefacts(gh_token, verbose=False):
 def crawl_docs(gh_token, verbose=False):
     """Fetch and parse architecture-relevant docs from OB1's docs/ directory.
 
-    Emits entries under category=ARCHITECTURE_CATEGORY for:
-      - docs/05-tool-audit.md (conceptual content only — sections 1-3 plus
-        intro; the prompt-kit section is excluded as it is implementation
-        tooling rather than architectural argument)
-      - docs/drafts/discord-chunking-discussion.md (whole file)
-      - docs/03-faq.md — sections matching FAQ_TARGET_H2_TITLES, chunked
-        by H3 with H2 lead text emitted as a separate entry when substantial
-
-    Procedural setup docs (01-getting-started, 02-companion-prompts,
-    04-ai-assisted-setup, video-walkthrough-script, workflow-pipeline.html,
-    and the xlsx guides) are intentionally excluded.
-
-    Returns a list of catalogue entry dicts (without embeddings yet).
+    Each entry includes gh_path, line_start, and line_end so that
+    generate_html.py can build GitHub #L{start}-L{end} deep links.
     """
     artefacts = []
     now = datetime.now(timezone.utc).isoformat()
@@ -730,33 +702,34 @@ def crawl_docs(gh_token, verbose=False):
     text = fetch_readme("docs/05-tool-audit.md", gh_token)
     time.sleep(0.25)
     if text:
-        # Trim before "## 4. Prompt Kits" — sections 1-3 plus the intro and
-        # "Why Tool Count Matters" are the conceptual content. The prompt
-        # kits and benchmark table are implementation tooling.
         lead = extract_doc_lead(text, r'^##\s+4\.\s+Prompt Kits')
         if not lead.strip():
             print("  [warn] tool-audit lead extraction returned empty — using full doc")
             lead = text
         title_match = re.search(r'^#\s+(.+)$', lead, re.MULTILINE)
         title = title_match.group(1).strip() if title_match else "MCP Tool Audit Guide"
+        line_end = len(lead.splitlines())
         artefacts.append({
-            "slug": "tool-audit",
-            "category": ARCHITECTURE_CATEGORY,
-            "title": title,
-            "tagline": "",
+            "slug":        "tool-audit",
+            "category":    ARCHITECTURE_CATEGORY,
+            "title":       title,
+            "tagline":     "",
             "description": (
                 "Conceptual guide to auditing MCP tool surface area, "
                 "merging redundant CRUD tools, and scoping tools across "
                 "capture/query/admin servers based on usage patterns. "
                 "Direct response to issue #36."
             ),
-            "embed_text": lead,
-            "embedding": None,
+            "embed_text":  lead,
+            "embedding":   None,
             "readme_path": "docs/05-tool-audit.md",
-            "fetched_at": now,
+            "gh_path":     "docs/05-tool-audit.md",
+            "line_start":  1,
+            "line_end":    line_end,
+            "fetched_at":  now,
         })
         if verbose:
-            print(f"    tool-audit ({len(lead)} chars)")
+            print(f"    tool-audit ({len(lead)} chars, lines 1-{line_end})")
     else:
         print("  [warn] docs/05-tool-audit.md not found")
 
@@ -767,24 +740,28 @@ def crawl_docs(gh_token, verbose=False):
     if text:
         title_match = re.search(r'^#\s+(.+)$', text, re.MULTILINE)
         title = title_match.group(1).strip() if title_match else "Chunking Columns Discussion"
+        line_end = len(text.splitlines())
         artefacts.append({
-            "slug": "chunking-discussion",
-            "category": ARCHITECTURE_CATEGORY,
-            "title": title,
-            "tagline": "",
+            "slug":        "chunking-discussion",
+            "category":    ARCHITECTURE_CATEGORY,
+            "title":       title,
+            "tagline":     "",
             "description": (
                 "Draft Discord post weighing whether chunking columns "
                 "(parent_id, chunk_index, full_text) belong in the default "
                 "thoughts schema or as an opt-in primitive. References "
                 "PRs #27, #53, #54."
             ),
-            "embed_text": text,
-            "embedding": None,
+            "embed_text":  text,
+            "embedding":   None,
             "readme_path": "docs/drafts/discord-chunking-discussion.md",
-            "fetched_at": now,
+            "gh_path":     "docs/drafts/discord-chunking-discussion.md",
+            "line_start":  1,
+            "line_end":    line_end,
+            "fetched_at":  now,
         })
         if verbose:
-            print(f"    chunking-discussion ({len(text)} chars)")
+            print(f"    chunking-discussion ({len(text)} chars, lines 1-{line_end})")
     else:
         print("  [warn] docs/drafts/discord-chunking-discussion.md not found")
 
@@ -809,40 +786,41 @@ def crawl_docs(gh_token, verbose=False):
                 slug = f"faq-{slugify(h2)}-overview"
                 tagline = ""
             elif h3 is None:
-                # Whole H2 as one entry (no H3 children present).
                 title = h2.strip().strip('"\'')
                 slug = f"faq-{slugify(h2)}"
                 tagline = ""
             else:
                 title = h3.strip().strip('"\'')
                 slug = f"faq-{slugify(h3)}"
-                # Use parent H2 as tagline so embedding has the broader context.
                 tagline = h2.strip().strip('"\'')
 
-            # embed_text leads with the title (and tagline when present) so
-            # the embedding picks up the framing question alongside the body.
             preamble_parts = [p for p in [title, tagline] if p and p != title]
             preamble = ". ".join([title] + preamble_parts)
             embed_text = f"{preamble}\n\n{chunk['content']}"
 
-            # description is a short preview (first ~500 chars of body).
             description = chunk["content"][:500]
             if len(chunk["content"]) > 500:
                 description = description.rstrip() + "…"
 
             artefacts.append({
-                "slug": slug,
-                "category": ARCHITECTURE_CATEGORY,
-                "title": title,
-                "tagline": tagline,
+                "slug":        slug,
+                "category":    ARCHITECTURE_CATEGORY,
+                "title":       title,
+                "tagline":     tagline,
                 "description": description,
-                "embed_text": embed_text,
-                "embedding": None,
+                "embed_text":  embed_text,
+                "embedding":   None,
                 "readme_path": "docs/03-faq.md",
-                "fetched_at": now,
+                "gh_path":     "docs/03-faq.md",
+                "line_start":  chunk["line_start"],
+                "line_end":    chunk["line_end"],
+                "fetched_at":  now,
             })
             if verbose:
-                print(f"    {slug} ({len(embed_text)} chars)")
+                print(
+                    f"    {slug} ({len(embed_text)} chars, "
+                    f"lines {chunk['line_start']}-{chunk['line_end']})"
+                )
     else:
         print("  [warn] docs/03-faq.md not found")
 
@@ -850,10 +828,7 @@ def crawl_docs(gh_token, verbose=False):
 
 
 def add_embeddings(artefacts, api_key):
-    """
-    Generate embeddings for all artefacts in a single batched API call.
-    Updates artefacts in-place.
-    """
+    """Generate embeddings for all artefacts. Updates artefacts in-place."""
     texts = [a["embed_text"] for a in artefacts]
     print(f"\nGenerating embeddings for {len(texts)} artefacts...")
     vectors = embed_texts(texts, api_key)
@@ -888,7 +863,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # --- Tokens ---
     print("Resolving GitHub token...")
     gh_token = get_github_token()
     if not gh_token:
@@ -904,43 +878,45 @@ def main():
     else:
         or_key = ""
 
-    # --- Crawl artefact directories ---
     artefacts = crawl_artefacts(gh_token, verbose=args.verbose)
     print(f"\nCrawled {len(artefacts)} artefacts from artefact directories")
 
-    # --- Crawl architecture docs ---
     arch_entries = crawl_docs(gh_token, verbose=args.verbose)
     print(f"\nExtracted {len(arch_entries)} architecture entries from docs/")
     artefacts.extend(arch_entries)
 
     print(f"\nTotal catalogue entries: {len(artefacts)}")
 
-    # --- Embed ---
     if or_key and not args.no_embed:
         add_embeddings(artefacts, or_key)
     else:
         print("\nSkipping embeddings.")
 
-    # --- Write output ---
     output = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "repo": f"{GH_OWNER}/{GH_REPO}",
-        "embed_model": EMBED_MODEL if (or_key and not args.no_embed) else None,
+        "generated_at":   datetime.now(timezone.utc).isoformat(),
+        "repo":           f"{GH_OWNER}/{GH_REPO}",
+        "embed_model":    EMBED_MODEL if (or_key and not args.no_embed) else None,
         "artefact_count": len(artefacts),
-        "artefacts": artefacts,
+        "artefacts":      artefacts,
     }
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
     print(f"\nWritten: {args.out}")
 
-    # --- Summary ---
     print("\nEntries by category:")
     by_cat = {}
     for a in artefacts:
         by_cat.setdefault(a["category"], []).append(a["slug"])
     for cat, slugs in sorted(by_cat.items()):
         print(f"  {cat}: {len(slugs)}")
+
+    print("\nGitHub link info:")
+    for a in artefacts:
+        if a.get("line_start"):
+            print(f"  {a['slug']}: {a['gh_path']}#L{a['line_start']}-L{a['line_end']}")
+        else:
+            print(f"  {a['slug']}: {a['gh_path']}/ (directory)")
 
     print("\nParsing quality check (entries with short or missing embed_text):")
     warnings = 0
