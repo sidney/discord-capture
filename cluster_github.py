@@ -7,11 +7,12 @@ Extends the work done by cluster_discord.py by fetching:
   - PR bodies and PR discussion comments for all mapped PRs
   - PR review thread comments (inline code review feedback)
 
-Appends results to the same artefact_linkages table in discord_archive.db,
-and regenerates the linkage_report files to include GitHub content.
+Appends results to the same artefact_linkages table in discord_archive.db.
+Report generation is handled by cluster_embed.py (pass 5), which must be
+run after this script to produce updated CSV and HTML output.
 
 Usage:
-  python3 cluster_github.py [--db PATH] [--out-dir PATH] [--dry-run]
+  python3 cluster_github.py [--db PATH] [--dry-run]
 
 Token resolution order (first match wins):
   1. GITHUB_TOKEN environment variable
@@ -28,15 +29,12 @@ Either gives 5000 req/hr on public repos with zero write capability.
 
 import sqlite3
 import json
-import csv
-import re
 import time
 import argparse
 import os
 import urllib.request
 import urllib.error
 from collections import defaultdict
-from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +551,6 @@ def pass4a_issues(token):
             c_body = comment.get("body", "") or ""
             c_user = comment.get("user", {}).get("login", "")
             c_ts = comment.get("created_at", "")
-            c_url = comment.get("html_url", "")
             # Include issue title for context
             c_combined = f"{title}\n{c_body}"
 
@@ -730,102 +727,6 @@ def append_to_linkage_table(conn, results, dry_run=False):
 
 
 # ---------------------------------------------------------------------------
-# Regenerate reports (combined Discord + GitHub)
-# ---------------------------------------------------------------------------
-
-def regenerate_reports(conn, out_dir):
-    """Read all linkage rows and rewrite the report files."""
-    cur = conn.execute(
-        """SELECT pass, match_basis, channel_name, category,
-                  artefact_slug, artefact_title, artefact_category,
-                  score, window_start, window_end, github_refs, sample_text
-           FROM artefact_linkages
-           ORDER BY artefact_slug, score DESC"""
-    )
-    rows = cur.fetchall()
-    fields = ["pass", "match_basis", "channel_name", "category",
-              "artefact_slug", "artefact_title", "artefact_category",
-              "score", "window_start", "window_end", "github_refs", "sample_text"]
-    results = [dict(zip(fields, r)) for r in rows]
-
-    # CSV
-    csv_path = os.path.join(out_dir, "linkage_report_full.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for r in results:
-            writer.writerow(r)
-    print(f"Written: {csv_path}")
-
-    # Summary markdown
-    md_path = os.path.join(out_dir, "linkage_report_full.md")
-    _write_summary_md(results, md_path)
-    print(f"Written: {md_path}")
-
-
-def _write_summary_md(results, path):
-    by_artefact = defaultdict(list)
-    for r in results:
-        slug = r.get("artefact_slug")
-        if slug:
-            by_artefact[slug].append(r)
-
-    lines = ["# OB1 Discord + GitHub → Artefact Linkage Report (Full)", ""]
-    lines.append(f"Generated: {datetime.now().isoformat()}")
-    lines.append(f"Total linkage rows: {len(results)}")
-    lines.append(f"Artefacts matched: {len(by_artefact)}")
-    lines.append("")
-
-    # Score by pass so we can show Discord vs GitHub breakdown
-    def total_score(entries):
-        return sum(e["score"] for e in entries)
-
-    lines.append("## Artefacts by combined score (Discord + GitHub)")
-    lines.append("")
-    for slug in sorted(by_artefact, key=lambda s: -total_score(by_artefact[s])):
-        entries = by_artefact[slug]
-        disc = [e for e in entries if e["pass"] in (1, 2, 3)]
-        gh = [e for e in entries if e["pass"] == 4]
-        title = ARTEFACTS.get(slug, {}).get("title", slug)
-        disc_score = sum(e["score"] for e in disc)
-        gh_score = sum(e["score"] for e in gh)
-        total = disc_score + gh_score
-        lines.append(
-            f"### `{slug}` — {title} "
-            f"(total: {total} | Discord: {disc_score} | GitHub: {gh_score})"
-        )
-        seen = set()
-        for e in sorted(entries, key=lambda x: -x["score"]):
-            ch = e["channel_name"]
-            if ch in seen:
-                continue
-            seen.add(ch)
-            basis = e["match_basis"]
-            score = e["score"]
-            sample = (e.get("sample_text") or "")[:100].replace("\n", " ")
-            lines.append(f"  - [{basis}, {score}] **{ch}**: {sample}…")
-        lines.append("")
-
-    # GitHub refs summary
-    lines.append("## GitHub PR/issue references (all passes)")
-    lines.append("")
-    all_refs = defaultdict(set)
-    for r in results:
-        refs = r.get("github_refs")
-        if refs:
-            parsed = json.loads(refs) if isinstance(refs, str) else refs
-            for ref in parsed:
-                all_refs[ref].add(r["channel_name"])
-    for ref in sorted(all_refs,
-                      key=lambda x: int(re.search(r"\d+", x).group())):
-        channels = "; ".join(sorted(all_refs[ref]))
-        lines.append(f"- `{ref}` — {channels}")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -837,11 +738,6 @@ def main():
         "--db",
         default=os.path.expanduser("~/discord-capture/discord_archive.db"),
         help="Path to discord_archive.db (must have artefact_linkages table)",
-    )
-    parser.add_argument(
-        "--out-dir",
-        default=os.path.expanduser("~/discord-output"),
-        help="Directory to write updated report files",
     )
     parser.add_argument(
         "--dry-run",
@@ -856,8 +752,6 @@ def main():
         print("  [token] No token found — using unauthenticated API (60 req/hr).")
         print("  Set GITHUB_TOKEN, add github_vault_secret_ocid to config.json,")
         print("  or write a token to ~/.github_token")
-
-    os.makedirs(args.out_dir, exist_ok=True)
 
     conn = sqlite3.connect(args.db)
 
@@ -882,10 +776,6 @@ def main():
     print(f"Total GitHub linkages: {len(all_gh)}")
 
     append_to_linkage_table(conn, all_gh, dry_run=args.dry_run)
-
-    print("Regenerating combined reports...")
-    regenerate_reports(conn, args.out_dir)
-
     conn.close()
 
     # Quick top-10 by combined GitHub score
@@ -894,13 +784,12 @@ def main():
         slug = r.get("artefact_slug")
         if slug:
             by_artefact[slug] += r["score"]
-    print("\nTop artefacts by GitHub score:")
+    print("\nTop artefacts by GitHub term score:")
     for slug, score in sorted(by_artefact.items(), key=lambda x: -x[1])[:10]:
         print(f"  {score:4d}  {slug}")
 
-    print("\nDone. Fetch the updated reports:")
-    print(f"  scp ubuntu@144.24.44.81:{args.out_dir}/linkage_report_full.md ~/Desktop/")
-    print(f"  scp ubuntu@144.24.44.81:{args.out_dir}/linkage_report_full.csv ~/Desktop/")
+    print("\nPass 4 complete. Run cluster_embed.py next to generate reports:")
+    print("  python3 ~/discord-capture/cluster_embed.py")
 
 
 if __name__ == "__main__":
