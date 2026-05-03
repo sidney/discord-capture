@@ -14,6 +14,7 @@ Defaults:
   --csv       ~/discord-output/linkage_report_full.csv
   --stats     ~/discord-output/source_stats.json
   --out       ~/discord-output/linkage_map.html
+  --guild-id  1481783256641699840  (OB1 Discord server)
   --gh-owner  NateBJones-Projects
   --gh-repo   OB1
 
@@ -990,8 +991,9 @@ def main():
     )
     parser.add_argument(
         "--guild-id",
-        default="",
-        help="Discord guild (server) ID for deep-linking Discord threads. "
+        default="1481783256641699840",
+        help="Discord guild (server) ID for deep-linking Discord threads "
+             "(default: 1481783256641699840, the OB1 server). "
              "Find it in the server URL: discord.com/channels/{guild_id}/...",
     )
     parser.add_argument(
