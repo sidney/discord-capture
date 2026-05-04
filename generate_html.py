@@ -43,6 +43,7 @@ GitHub links — artefacts:
 import csv
 import json
 import os
+import shutil
 import argparse
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -835,7 +836,7 @@ function sourceHTML(s) {
 function artefactGhUrl(a) {
   if (!REPORT.gh_owner || !REPORT.gh_repo || !a.gh_path) return null;
   if (a.line_start && a.line_end) {
-    return `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/blob/main/${a.gh_path}?plain=1#L${a.line_start}-L${a.line_end}`;
+    return `viewer.html?owner=${encodeURIComponent(REPORT.gh_owner)}&repo=${encodeURIComponent(REPORT.gh_repo)}&path=${encodeURIComponent(a.gh_path)}&lines=${a.line_start}-${a.line_end}`;
   }
   return `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/tree/main/${a.gh_path}`;
 }
@@ -853,8 +854,11 @@ function cardHTML(a) {
   // onclick="event.stopPropagation()" prevents the link click from also
   // toggling the card open/closed.
   const ghUrl = artefactGhUrl(a);
+  const targetAttr = (a.line_start && a.line_end) ? 'ob1_md_viewer' : '_blank';
+  const relAttr = targetAttr === '_blank' ? 'rel="noopener"' : '';
+  
   const slugEl = ghUrl
-    ? `<a class="card-slug" href="${escHtml(ghUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${escHtml(a.slug)}</a>`
+    ? `<a class="card-slug" href="${escHtml(ghUrl)}" target="${targetAttr}" ${relAttr} onclick="event.stopPropagation()">${escHtml(a.slug)}</a>`
     : `<span class="card-slug">${escHtml(a.slug)}</span>`;
 
   return `
@@ -1137,9 +1141,21 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(html)
 
+    # Copy viewer.html to the output directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    viewer_src = os.path.join(script_dir, "viewer.html")
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    viewer_dest = os.path.join(out_dir, "viewer.html")
+    
+    if os.path.exists(viewer_src):
+        shutil.copy2(viewer_src, viewer_dest)
+        print(f"Copied: {viewer_dest}")
+    else:
+        print(f"\n[warn] viewer.html not found in {script_dir}, skipped copying.")
+
     print(f"\nWritten: {args.out}")
     print(f"\nTo fetch:")
-    print(f"  scp ubuntu@144.24.44.81:{args.out} ~/Desktop/linkage_map.html")
+    print(f"  scp ubuntu@144.24.44.81:{args.out} ubuntu@144.24.44.81:{viewer_dest} ~/Desktop/")
 
 
 if __name__ == "__main__":
