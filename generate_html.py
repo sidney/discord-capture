@@ -8,29 +8,42 @@ can be opened in any browser without a server.
 
 Usage:
   python3 generate_html.py [--csv PATH] [--stats PATH] [--out PATH]
+                            [--catalogue PATH]
                             [--guild-id ID] [--gh-owner OWNER] [--gh-repo REPO]
 
 Defaults:
-  --csv       ~/discord-output/linkage_report_full.csv
-  --stats     ~/discord-output/source_stats.json
-  --out       ~/discord-output/linkage_map.html
-  --gh-owner  NateBJones-Projects
-  --gh-repo   OB1
+  --csv        ~/discord-output/linkage_report_full.csv
+  --stats      ~/discord-output/source_stats.json
+  --out        ~/discord-output/linkage_map.html
+  --catalogue  ~/discord-capture/ob1_catalogue.json
+  --guild-id   1481783256641699840  (OB1 Discord server)
+  --gh-owner   NateBJones-Projects
+  --gh-repo    OB1
 
 Discord deep links:
   Supply --guild-id to enable clickable links on Discord thread sources
-  (pass 1–3). The guild ID is the first numeric segment in any Discord
+  (pass 1-3). The guild ID is the first numeric segment in any Discord
   channel URL: discord.com/channels/{guild_id}/{channel_id}/...
   Without --guild-id the thread names render as plain text.
 
-GitHub links:
-  PR#N and issue#N refs in pass 4–5 sources are always rendered as
-  clickable github.com links using --gh-owner and --gh-repo.
+GitHub links — sources:
+  PR#N and issue#N refs in pass 4-5 sources are rendered as clickable
+  github.com links using --gh-owner and --gh-repo.
+
+GitHub links — artefacts:
+  If --catalogue points to a valid ob1_catalogue.json, each artefact card
+  slug becomes a clickable link to the artefact in the OB1 repo:
+    - Directory artefacts (recipes, integrations, etc.): tree/main/{dir}/{slug}
+    - Architecture doc chunks (docs/): blob/main/{file}?plain=1#L{start}-L{end}
+      (?plain=1 forces GitHub to show the source view where line highlights work;
+      without it, GitHub renders markdown as HTML and ignores the #L anchors)
+  Without the catalogue, slugs render as plain text.
 """
 
 import csv
 import json
 import os
+import shutil
 import argparse
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -61,11 +74,40 @@ def load_stats(path):
         return json.load(f).get("sources", [])
 
 
+def load_artefact_meta(catalogue_path):
+    """Load gh_path and line numbers from ob1_catalogue.json.
+
+    Returns a dict {slug: {gh_path, line_start, line_end}}, or an empty dict
+    if the catalogue is absent or unreadable. Used to build clickable GitHub
+    links from artefact card headers.
+    """
+    if not catalogue_path or not os.path.exists(catalogue_path):
+        return {}
+    try:
+        with open(catalogue_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"  [warn] Could not load catalogue {catalogue_path}: {e}")
+        return {}
+    meta = {}
+    for a in data.get("artefacts", []):
+        slug = a.get("slug")
+        if not slug:
+            continue
+        meta[slug] = {
+            "gh_path":    a.get("gh_path") or "",
+            "line_start": a.get("line_start"),
+            "line_end":   a.get("line_end"),
+        }
+    return meta
+
+
 # ---------------------------------------------------------------------------
 # Report assembly
 # ---------------------------------------------------------------------------
 
-def build_report(csv_path, stats_path, guild_id="", gh_owner="", gh_repo=""):
+def build_report(csv_path, stats_path, guild_id="", gh_owner="", gh_repo="",
+                 artefact_meta=None):
     rows = load_csv(csv_path)
     stats = load_stats(stats_path)
 
@@ -123,6 +165,13 @@ def build_report(csv_path, stats_path, guild_id="", gh_owner="", gh_repo=""):
         a["title"] = a["title"] or a["slug"]
         a["sources"].sort(key=lambda s: (-s["pass"], -s["score"]))
         a["total"] = a["discord_score"] + a["term_score"] + a["embed_score"]
+
+        # Merge GitHub link info from catalogue
+        meta = (artefact_meta or {}).get(a["slug"], {})
+        a["gh_path"]    = meta.get("gh_path") or ""
+        a["line_start"] = meta.get("line_start")
+        a["line_end"]   = meta.get("line_end")
+
         artefacts.append(a)
 
     # Default sort: embed desc, total desc
@@ -414,6 +463,16 @@ select:focus { border-color: var(--embed); }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Clickable slug link — stops propagation so it doesn't toggle the card */
+a.card-slug {
+  text-decoration: none;
+  border-bottom: 1px solid rgba(184,212,232,0.2);
+  transition: color 0.12s, border-color 0.12s;
+}
+a.card-slug:hover {
+  color: var(--embed);
+  border-bottom-color: var(--embed);
 }
 .card-title {
   font-size: 11px;
@@ -719,6 +778,21 @@ function bar(label, score, max, cls) {
     </div>`;
 }
 
+// ---------- GitHub ref formatting ----------
+function formatGhRef(ref) {
+  if (!ref) return '';
+  const prM  = String(ref).match(/^PR#(\d+)$/);
+  const issM = String(ref).match(/^issue#(\d+)$/);
+  if (prM && REPORT.gh_owner && REPORT.gh_repo) {
+    const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/pull/${prM[1]}`;
+    return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
+  } else if (issM && REPORT.gh_owner && REPORT.gh_repo) {
+    const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/issues/${issM[1]}`;
+    return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
+  }
+  return escHtml(ref);
+}
+
 // ---------- source item HTML ----------
 function sourceHTML(s) {
   const scoreStr = s.pass === 5
@@ -730,23 +804,24 @@ function sourceHTML(s) {
   if (s.pass <= 3 && s.channel_id && REPORT.guild_id) {
     const url = `https://discord.com/channels/${REPORT.guild_id}/${s.channel_id}`;
     channelEl = `<a class="source-channel source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(s.channel)}</a>`;
+  } else if (s.pass >= 4 && REPORT.gh_owner && REPORT.gh_repo) {
+    const prM = String(s.channel).match(/^PR#(\d+)/);
+    const issM = String(s.channel).match(/^issue#(\d+)/);
+    if (prM) {
+      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/pull/${prM[1]}`;
+      channelEl = `<a class="source-channel source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(s.channel)}</a>`;
+    } else if (issM) {
+      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/issues/${issM[1]}`;
+      channelEl = `<a class="source-channel source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(s.channel)}</a>`;
+    } else {
+      channelEl = `<span class="source-channel">${escHtml(s.channel)}</span>`;
+    }
   } else {
     channelEl = `<span class="source-channel">${escHtml(s.channel)}</span>`;
   }
 
   // GitHub ref links (passes 4\u20135)
-  const refParts = (s.refs || []).map(ref => {
-    const prM  = ref.match(/^PR#(\d+)$/);
-    const issM = ref.match(/^issue#(\d+)$/);
-    if (prM && REPORT.gh_owner && REPORT.gh_repo) {
-      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/pull/${prM[1]}`;
-      return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
-    } else if (issM && REPORT.gh_owner && REPORT.gh_repo) {
-      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/issues/${issM[1]}`;
-      return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
-    }
-    return escHtml(ref);
-  });
+  const refParts = (s.refs || []).map(formatGhRef);
   const refsStr = refParts.length
     ? `<span class="source-refs">${refParts.join(' + ')}</span>`
     : '';
@@ -767,6 +842,21 @@ function sourceHTML(s) {
     </div>`;
 }
 
+// ---------- artefact GitHub URL ----------
+// Returns a URL to the artefact in the OB1 repo, or null if no link data.
+// Directory artefacts (recipes, integrations, etc.) get a tree/main/ link.
+// Architecture doc chunks get a blob/main/?plain=1#L{start}-L{end} link.
+// ?plain=1 is required for .md files: without it GitHub shows the rendered
+// HTML view where #L anchors have no effect; plain=1 forces the source view
+// where the line highlight works correctly.
+function artefactGhUrl(a) {
+  if (!REPORT.gh_owner || !REPORT.gh_repo || !a.gh_path) return null;
+  if (a.line_start && a.line_end) {
+    return `viewer.html?owner=${encodeURIComponent(REPORT.gh_owner)}&repo=${encodeURIComponent(REPORT.gh_repo)}&path=${encodeURIComponent(a.gh_path)}&lines=${a.line_start}-${a.line_end}`;
+  }
+  return `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/tree/main/${a.gh_path}`;
+}
+
 // ---------- artefact card HTML ----------
 function cardHTML(a) {
   const isOpen = openCards.has(a.slug);
@@ -775,10 +865,22 @@ function cardHTML(a) {
              + bar('term',  a.term_score,  REPORT.max_term,  't')
              + bar('disc',  a.discord_score, REPORT.max_discord, 'd');
   const sourcesInner = a.sources.map(sourceHTML).join('');
+
+  // Slug is a clickable link when catalogue data is present; otherwise plain text.
+  // onclick="event.stopPropagation()" prevents the link click from also
+  // toggling the card open/closed.
+  const ghUrl = artefactGhUrl(a);
+  const targetAttr = (a.line_start && a.line_end) ? 'ob1_md_viewer' : '_blank';
+  const relAttr = targetAttr === '_blank' ? 'rel="noopener"' : '';
+  
+  const slugEl = ghUrl
+    ? `<a class="card-slug" href="${escHtml(ghUrl)}" target="${targetAttr}" ${relAttr} onclick="event.stopPropagation()">${escHtml(a.slug)}</a>`
+    : `<span class="card-slug">${escHtml(a.slug)}</span>`;
+
   return `
     <div class="card${isOpen ? ' open' : ''}" data-slug="${escHtml(a.slug)}">
       <div class="card-head" onclick="toggleCard('${escHtml(a.slug)}')">
-        <span class="card-slug">${escHtml(a.slug)}</span>
+        ${slugEl}
         <span class="card-title">${escHtml(a.title)}</span>
         <div class="card-meta">
           <span class="cat-badge ${catClass(a.artefact_category)}">${escHtml(a.artefact_category || '?')}</span>
@@ -868,7 +970,7 @@ function renderOrphans() {
         <td>${o.p4 || 0}</td>
         <td style="color:var(--text-dim)">${escHtml(o.basis)}</td>
         <td>
-          <div class="orphan-ref">${escHtml(o.ref)}</div>
+          <div class="orphan-ref">${formatGhRef(o.ref)}</div>
           <div class="orphan-channel">${escHtml(o.channel)}</div>
           ${sample ? `<div class="orphan-sample">${escHtml(sample)}</div>` : ''}
         </td>
@@ -989,9 +1091,17 @@ def main():
         help="Output HTML path (default: ~/discord-output/linkage_map.html)",
     )
     parser.add_argument(
+        "--catalogue",
+        default=os.path.expanduser("~/discord-capture/ob1_catalogue.json"),
+        help="Path to ob1_catalogue.json for GitHub artefact links "
+             "(default: ~/discord-capture/ob1_catalogue.json; optional — "
+             "without it, artefact slugs render as plain text rather than links)",
+    )
+    parser.add_argument(
         "--guild-id",
-        default="",
-        help="Discord guild (server) ID for deep-linking Discord threads. "
+        default="1481783256641699840",
+        help="Discord guild (server) ID for deep-linking Discord threads "
+             "(default: 1481783256641699840, the OB1 server). "
              "Find it in the server URL: discord.com/channels/{guild_id}/...",
     )
     parser.add_argument(
@@ -1016,6 +1126,13 @@ def main():
         print(f"Reading stats: {args.stats}")
     else:
         print(f"Stats not found ({args.stats}) \u2014 orphan section will be empty")
+
+    artefact_meta = load_artefact_meta(args.catalogue)
+    if artefact_meta:
+        print(f"Catalogue loaded: {len(artefact_meta)} entries \u2014 artefact GitHub links enabled")
+    else:
+        print(f"Catalogue not found ({args.catalogue}) \u2014 artefact slugs will be plain text")
+
     if args.guild_id:
         print(f"Discord guild ID: {args.guild_id} \u2014 Discord thread links enabled")
     else:
@@ -1026,6 +1143,7 @@ def main():
         guild_id=args.guild_id,
         gh_owner=args.gh_owner,
         gh_repo=args.gh_repo,
+        artefact_meta=artefact_meta,
     )
     print(f"  {report['n_artefacts']} artefacts | "
           f"{report['n_sources']} sources | "
@@ -1039,9 +1157,21 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(html)
 
+    # Copy viewer.html to the output directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    viewer_src = os.path.join(script_dir, "viewer.html")
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    viewer_dest = os.path.join(out_dir, "viewer.html")
+    
+    if os.path.exists(viewer_src):
+        shutil.copy2(viewer_src, viewer_dest)
+        print(f"Copied: {viewer_dest}")
+    else:
+        print(f"\n[warn] viewer.html not found in {script_dir}, skipped copying.")
+
     print(f"\nWritten: {args.out}")
     print(f"\nTo fetch:")
-    print(f"  scp ubuntu@144.24.44.81:{args.out} ~/Desktop/linkage_map.html")
+    print(f"  scp ubuntu@144.24.44.81:{args.out} ubuntu@144.24.44.81:{viewer_dest} ~/Desktop/")
 
 
 if __name__ == "__main__":

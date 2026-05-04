@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OB1 Markdown Viewer</title>
+  
+  <!-- Markdown parser and GitHub-like styling -->
+  <script src="https://cdn.jsdelivr.net/npm/markdown-it@13.0.1/dist/markdown-it.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-dark.min.css">
+  
+  <style>
+    body {
+      background-color: #0d1117;
+      color: #c9d1d9;
+      margin: 0;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 30px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+    }
+    .header {
+      border-bottom: 1px solid #30363d;
+      padding-bottom: 10px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      color: #8b949e;
+    }
+    .header a { color: #58a6ff; text-decoration: none; }
+    .header a:hover { text-decoration: underline; }
+    
+    .highlight {
+      background-color: rgba(210, 153, 34, 0.2);
+      border-left: 3px solid #d29922;
+      padding-left: 10px;
+      margin-left: -13px;
+      border-radius: 2px;
+      transition: background-color 0.5s ease;
+    }
+    
+    #loading { text-align: center; padding: 50px; color: #8b949e; }
+    .error { color: #f85149; border: 1px solid #f85149; padding: 15px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header" id="header">Loading document...</div>
+  <div id="loading">Fetching and rendering markdown...</div>
+  <div id="content" class="markdown-body" style="display: none;"></div>
+</div>
+<script>
+  const params = new URLSearchParams(window.location.search);
+  const owner = params.get('owner');
+  const repo = params.get('repo');
+  const path = params.get('path');
+  const lines = params.get('lines');
+  
+  const headerEl = document.getElementById('header');
+  const contentEl = document.getElementById('content');
+  const loadingEl = document.getElementById('loading');
+  if (!owner || !repo || !path) {
+    loadingEl.innerHTML = '<div class="error">Missing required parameters (owner, repo, path).</div>';
+  } else {
+    const ghUrl = `https://github.com/${owner}/${repo}/blob/main/${path}`;
+    headerEl.innerHTML = `Viewing <a href="${ghUrl}" target="_blank">${owner}/${repo} - ${path}</a>`;
+    if (lines) headerEl.innerHTML += ` (Lines ${lines})`;
+    const md = window.markdownit({ html: true, linkify: true });
+    
+    function injectLineNumbers(tokens, idx, options, env, slf) {
+      if (tokens[idx].map && tokens[idx].level === 0) {
+        const startLine = tokens[idx].map[0] + 1;
+        const endLine = tokens[idx].map[1];
+        tokens[idx].attrJoin('data-line-start', String(startLine));
+        tokens[idx].attrJoin('data-line-end', String(endLine));
+      }
+      return slf.renderToken(tokens, idx, options, env, slf);
+    }
+    md.renderer.rules.paragraph_open = md.renderer.rules.heading_open = 
+    md.renderer.rules.blockquote_open = md.renderer.rules.bullet_list_open = 
+    md.renderer.rules.ordered_list_open = md.renderer.rules.code_block = 
+    md.renderer.rules.fence = injectLineNumbers;
+    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`;
+    
+    fetch(rawUrl).then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        return response.text();
+      }).then(markdown => {
+        contentEl.innerHTML = DOMPurify.sanitize(md.render(markdown), {
+          ADD_ATTR: ['data-line-start', 'data-line-end']
+        });
+        loadingEl.style.display = 'none';
+        contentEl.style.display = 'block';
+        if (lines) {
+          const [startStr, endStr] = lines.split('-');
+          const targetStart = parseInt(startStr, 10);
+          const targetEnd = parseInt(endStr, 10) || targetStart;
+          let firstHighlighted = null;
+          const elements = contentEl.querySelectorAll('[data-line-start]');
+          elements.forEach(el => {
+            const elStart = parseInt(el.getAttribute('data-line-start'), 10);
+            const elEnd = parseInt(el.getAttribute('data-line-end'), 10);
+            if (elStart <= targetEnd && elEnd >= targetStart) {
+              el.classList.add('highlight');
+              if (!firstHighlighted) firstHighlighted = el;
+            }
+          });
+          if (firstHighlighted) {
+            setTimeout(() => {
+              firstHighlighted.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }, 100);
+          }
+        }
+      }).catch(error => {
+        loadingEl.innerHTML = `<div class="error">Failed to load markdown: ${error.message}</div>`;
+      });
+  }
+</script>
+</body>
+</html>
