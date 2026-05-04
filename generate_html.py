@@ -778,6 +778,21 @@ function bar(label, score, max, cls) {
     </div>`;
 }
 
+// ---------- GitHub ref formatting ----------
+function formatGhRef(ref) {
+  if (!ref) return '';
+  const prM  = String(ref).match(/^PR#(\d+)$/);
+  const issM = String(ref).match(/^issue#(\d+)$/);
+  if (prM && REPORT.gh_owner && REPORT.gh_repo) {
+    const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/pull/${prM[1]}`;
+    return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
+  } else if (issM && REPORT.gh_owner && REPORT.gh_repo) {
+    const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/issues/${issM[1]}`;
+    return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
+  }
+  return escHtml(ref);
+}
+
 // ---------- source item HTML ----------
 function sourceHTML(s) {
   const scoreStr = s.pass === 5
@@ -789,23 +804,24 @@ function sourceHTML(s) {
   if (s.pass <= 3 && s.channel_id && REPORT.guild_id) {
     const url = `https://discord.com/channels/${REPORT.guild_id}/${s.channel_id}`;
     channelEl = `<a class="source-channel source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(s.channel)}</a>`;
+  } else if (s.pass >= 4 && REPORT.gh_owner && REPORT.gh_repo) {
+    const prM = String(s.channel).match(/^PR#(\d+)/);
+    const issM = String(s.channel).match(/^issue#(\d+)/);
+    if (prM) {
+      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/pull/${prM[1]}`;
+      channelEl = `<a class="source-channel source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(s.channel)}</a>`;
+    } else if (issM) {
+      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/issues/${issM[1]}`;
+      channelEl = `<a class="source-channel source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(s.channel)}</a>`;
+    } else {
+      channelEl = `<span class="source-channel">${escHtml(s.channel)}</span>`;
+    }
   } else {
     channelEl = `<span class="source-channel">${escHtml(s.channel)}</span>`;
   }
 
   // GitHub ref links (passes 4\u20135)
-  const refParts = (s.refs || []).map(ref => {
-    const prM  = ref.match(/^PR#(\d+)$/);
-    const issM = ref.match(/^issue#(\d+)$/);
-    if (prM && REPORT.gh_owner && REPORT.gh_repo) {
-      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/pull/${prM[1]}`;
-      return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
-    } else if (issM && REPORT.gh_owner && REPORT.gh_repo) {
-      const url = `https://github.com/${REPORT.gh_owner}/${REPORT.gh_repo}/issues/${issM[1]}`;
-      return `<a class="source-link" href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(ref)}</a>`;
-    }
-    return escHtml(ref);
-  });
+  const refParts = (s.refs || []).map(formatGhRef);
   const refsStr = refParts.length
     ? `<span class="source-refs">${refParts.join(' + ')}</span>`
     : '';
@@ -954,7 +970,7 @@ function renderOrphans() {
         <td>${o.p4 || 0}</td>
         <td style="color:var(--text-dim)">${escHtml(o.basis)}</td>
         <td>
-          <div class="orphan-ref">${escHtml(o.ref)}</div>
+          <div class="orphan-ref">${formatGhRef(o.ref)}</div>
           <div class="orphan-channel">${escHtml(o.channel)}</div>
           ${sample ? `<div class="orphan-sample">${escHtml(sample)}</div>` : ''}
         </td>
